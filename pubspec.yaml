@@ -1,0 +1,40 @@
+name: your_project_name
+description: A Flutter application with M-Pesa integration.
+
+# The following line prevents the package from being accidentally published to
+# pub.dev using `flutter pub publish`. This is preferred for private packages.
+publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Firebase Core (required)
+  firebase_core: ^2.24.0
+
+  # Cloud Firestore (for saving transactions)
+  cloud_firestore: ^4.9.0
+
+  # Firebase Messaging (for push notifications)
+  firebase_messaging: ^14.7.0
+
+  # HTTP requests to Render backend
+  http: ^1.1.0
+
+  # UI icons
+  cupertino_icons: ^1.0.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^3.0.0
+
+flutter:
+
+  uses-material-design: true
