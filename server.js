@@ -63,7 +63,8 @@ function validatePaymentRequest(req, res, next) {
     });
   }
 
-  const phoneRegex = /^254[0-9]{9}$/;
+  // Match Flutter app validation: 2547 or 2541 prefix, 12 digits total
+  const phoneRegex = /^254(7|1)[0-9]{8}$/;
 
   if (!phoneRegex.test(phone)) {
     return res.status(400).json({
@@ -78,12 +79,13 @@ function validatePaymentRequest(req, res, next) {
 // STK Push
 app.post("/api/mpesa/pay", validatePaymentRequest, async (req, res) => {
   try {
-    const { phone, amount, invoiceId } = req.body;
+    const { phone, amount, invoiceId, recordedByUid } = req.body;
 
     console.log("========== STK PUSH ==========");
     console.log("Phone:", phone);
     console.log("Amount:", amount);
     console.log("Invoice ID:", invoiceId);
+    console.log("Recorded By UID:", recordedByUid);
 
     // Generate meaningful account reference
     const accountReference = invoiceId ? `INV-${invoiceId}` : 'SELE-AGRO';
@@ -111,6 +113,11 @@ app.post("/api/mpesa/pay", validatePaymentRequest, async (req, res) => {
     // Add invoiceId if provided
     if (invoiceId) {
       transactionData.invoiceId = invoiceId;
+    }
+
+    // Add recordedByUid if provided (for Firestore read access control)
+    if (recordedByUid) {
+      transactionData.recordedByUid = recordedByUid;
     }
 
     await db.collection("transactions").doc(result.CheckoutRequestID).set(transactionData);
@@ -173,58 +180,74 @@ async function autoRecordPayment(txData, amount, receipt) {
 
   try {
     const invoiceRef = db.collection("invoices").doc(txData.invoiceId);
-    const invoiceDoc = await invoiceRef.get();
 
-    if (!invoiceDoc.exists) {
-      console.error("Invoice not found:", txData.invoiceId);
-      return;
-    }
+    // Use a Firestore transaction for atomic read-modify-write
+    // to prevent double-counting on concurrent callbacks
+    await db.runTransaction(async (transaction) => {
+      const invoiceDoc = await transaction.get(invoiceRef);
 
-    const invoiceData = invoiceDoc.data();
-    const currentAmountPaid = invoiceData.amountPaid || 0;
-    const newAmountPaid = currentAmountPaid + amount;
-    const total = invoiceData.total;
+      if (!invoiceDoc.exists) {
+        console.error("Invoice not found:", txData.invoiceId);
+        return;
+      }
 
-    // Determine new payment status
-    let paymentStatus = "unpaid";
-    if (newAmountPaid >= total) {
-      paymentStatus = "paid";
-    } else if (newAmountPaid > 0) {
-      paymentStatus = "partially_paid";
-    }
+      const invoiceData = invoiceDoc.data();
+      const currentAmountPaid = invoiceData.amountPaid || 0;
+      const newAmountPaid = currentAmountPaid + amount;
+      const total = invoiceData.total;
 
-    // Create payment reconciliation record
-    await db.collection("payment_reconciliations").add({
-      invoiceId: txData.invoiceId,
-      invoiceNumber: invoiceData.invoiceNumber,
-      customerName: invoiceData.customerName,
-      paymentMethod: "mpesa",
-      amount: amount,
-      referenceCode: receipt,
-      message: `M-Pesa STK Push - ${receipt}`,
-      depositDate: admin.firestore.FieldValue.serverTimestamp(),
-      reconciled: true, // Auto-reconciled (callback is proof)
-      reconciledByUid: "system",
-      reconciledByName: "M-Pesa Auto-Reconciliation",
-      reconciledAt: admin.firestore.FieldValue.serverTimestamp(),
-      recordedByUid: "system",
-      recordedByName: "M-Pesa STK Push",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      // Determine new payment status
+      let paymentStatus = "unpaid";
+      if (newAmountPaid >= total) {
+        paymentStatus = "paid";
+      } else if (newAmountPaid > 0) {
+        paymentStatus = "partially_paid";
+      }
+
+      // Create payment reconciliation record
+      const reconciliationRef = db.collection("payment_reconciliations").doc();
+      transaction.set(reconciliationRef, {
+        invoiceId: txData.invoiceId,
+        invoiceNumber: invoiceData.invoiceNumber,
+        customerName: invoiceData.customerName,
+        paymentMethod: "mpesa",
+        amount: amount,
+        referenceCode: receipt,
+        message: `M-Pesa STK Push - ${receipt}`,
+        depositDate: admin.firestore.FieldValue.serverTimestamp(),
+        reconciled: true, // Auto-reconciled (callback is proof)
+        reconciledByUid: "system",
+        reconciledByName: "M-Pesa Auto-Reconciliation",
+        reconciledAt: admin.firestore.FieldValue.serverTimestamp(),
+        recordedByUid: "system",
+        recordedByName: "M-Pesa STK Push",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Update invoice - also add to payments array and set mpesaCheckoutRequestId
+      const existingPayments = invoiceData.payments || [];
+      const newPayment = {
+        reference: receipt,
+        amount: amount,
+        date: new Date(),
+        paymentMethod: "mpesa",
+      };
+
+      transaction.update(invoiceRef, {
+        amountPaid: newAmountPaid,
+        paymentStatus: paymentStatus,
+        mpesaReceiptNumber: receipt,
+        mpesaCheckoutRequestId: txData.checkoutRequestID,
+        paymentDate: admin.firestore.FieldValue.serverTimestamp(),
+        payments: [...existingPayments, newPayment],
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      console.log("✅ Auto-recorded payment for invoice:", txData.invoiceId);
+      console.log("   Amount: KSh", amount);
+      console.log("   New amount paid: KSh", newAmountPaid);
+      console.log("   Status:", paymentStatus);
     });
-
-    // Update invoice
-    await invoiceRef.update({
-      amountPaid: newAmountPaid,
-      paymentStatus: paymentStatus,
-      mpesaReceiptNumber: receipt,
-      paymentDate: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    console.log("✅ Auto-recorded payment for invoice:", txData.invoiceId);
-    console.log("   Amount: KSh", amount);
-    console.log("   New amount paid: KSh", newAmountPaid);
-    console.log("   Status:", paymentStatus);
   } catch (err) {
     console.error("Error auto-recording payment:", err);
   }
@@ -260,7 +283,25 @@ app.post("/api/mpesa/callback", async (req, res) => {
     const txData = txDoc.data();
     console.log("Transaction found - Invoice ID:", txData.invoiceId);
 
+    // Idempotency check - prevent duplicate processing on callback retries
+    if (txData.status === "success") {
+      console.log("Transaction already processed - skipping duplicate callback");
+      return res.json({
+        ResultCode: 0,
+        ResultDesc: "Accepted",
+      });
+    }
+
     if (ResultCode === 0) {
+      // Guard against missing CallbackMetadata
+      if (!callback.CallbackMetadata || !callback.CallbackMetadata.Item) {
+        console.error("CallbackMetadata missing from successful callback");
+        return res.status(500).json({
+          ResultCode: 1,
+          ResultDesc: "Error",
+        });
+      }
+
       const items = callback.CallbackMetadata.Item;
 
       const amount = items.find(i => i.Name === "Amount")?.Value;
@@ -268,9 +309,10 @@ app.post("/api/mpesa/callback", async (req, res) => {
       const phone = items.find(i => i.Name === "PhoneNumber")?.Value;
       const transactionDate = items.find(i => i.Name === "TransactionDate")?.Value;
 
-      // Validate amount matches original request
-      if (amount && txData.amount && amount !== txData.amount) {
-        console.error("Amount mismatch - Expected:", txData.amount, "Got:", amount);
+      // Validate amount matches original request (compare as numbers)
+      const callbackAmount = parseFloat(amount);
+      if (callbackAmount && txData.amount && callbackAmount !== txData.amount) {
+        console.error("Amount mismatch - Expected:", txData.amount, "Got:", callbackAmount);
       }
 
       // Validate phone matches
@@ -280,7 +322,7 @@ app.post("/api/mpesa/callback", async (req, res) => {
 
       await db.collection("transactions").doc(CheckoutRequestID).update({
         status: "success",
-        amount: amount || txData.amount,
+        amount: callbackAmount || txData.amount,
         receipt,
         phone: phone || txData.phone,
         transactionDate,
@@ -292,7 +334,7 @@ app.post("/api/mpesa/callback", async (req, res) => {
       console.log("   Invoice ID:", txData.invoiceId || "N/A");
 
       // Auto-record payment to invoice
-      await autoRecordPayment(txData, amount || txData.amount, receipt);
+      await autoRecordPayment(txData, callbackAmount || txData.amount, receipt);
     } else {
       await db.collection("transactions").doc(CheckoutRequestID).update({
         status: "failed",
