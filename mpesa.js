@@ -38,7 +38,7 @@ async function stkPush({ phone, amount, accountReference, description }) {
     BusinessShortCode: process.env.SHORTCODE,
     Password: password,
     Timestamp: timestamp,
-    TransactionType: "CustomerPayBillOnline",
+    TransactionType: "CustomerBuyGoodsOnline",
     Amount: amount,
     PartyA: phone,
     PartyB: process.env.SHORTCODE,
