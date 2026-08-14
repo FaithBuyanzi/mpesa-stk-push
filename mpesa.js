@@ -41,7 +41,7 @@ async function stkPush({ phone, amount, accountReference, description }) {
     TransactionType: "CustomerBuyGoodsOnline",
     Amount: amount,
     PartyA: phone,
-    PartyB: process.env.SHORTCODE,
+    PartyB: process.env.PARTY_B,
     PhoneNumber: phone,
     CallBackURL: process.env.CALLBACK_URL,
     AccountReference: accountReference,
