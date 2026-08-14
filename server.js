@@ -86,6 +86,11 @@ app.post("/api/mpesa/pay", validatePaymentRequest, async (req, res) => {
     console.log("Amount:", amount);
     console.log("Invoice ID:", invoiceId);
     console.log("Recorded By UID:", recordedByUid);
+    console.log("========== MPESA CONFIG ==========");
+console.log("BASE_URL:", process.env.BASE_URL);
+console.log("SHORTCODE:", process.env.SHORTCODE);
+console.log("CALLBACK_URL:", process.env.CALLBACK_URL);
+console.log("TransactionType:", "CustomerBuyGoodsOnline"); 
 
     // Generate meaningful account reference
     const accountReference = invoiceId ? `INV-${invoiceId}` : 'SELE-AGRO';
