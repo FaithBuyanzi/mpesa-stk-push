@@ -259,10 +259,64 @@ app.post("/api/mpesa/query", async (req, res) => {
 // AUTO-RECORD STK PAYMENT TO INVOICE
 // ============================================================
 
+// Safaricom's STK callback never hands us the free-text SMS a
+// customer receives - only structured fields (amount, receipt,
+// phone, transaction date). Build a confirmation-style message
+// out of those real fields instead of just echoing the receipt.
+function formatMpesaTransactionDate(transactionDate) {
+  const str = String(transactionDate || "");
+
+  if (str.length !== 14) {
+    return null;
+  }
+
+  const day = str.slice(6, 8);
+  const month = str.slice(4, 6);
+  const year = str.slice(0, 4);
+  const hour24 = parseInt(str.slice(8, 10), 10);
+  const minute = str.slice(10, 12);
+
+  const meridiem = hour24 >= 12 ? "PM" : "AM";
+  const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12;
+
+  return `${day}/${month}/${year} ${hour12}:${minute} ${meridiem}`;
+}
+
+function buildMpesaConfirmationMessage({
+  receipt,
+  amount,
+  phone,
+  transactionDate,
+  invoiceNumber,
+}) {
+  const formattedDate = formatMpesaTransactionDate(transactionDate);
+  const formattedAmount = Number(amount).toFixed(2);
+
+  let message = `${receipt} Confirmed. Ksh${formattedAmount} received`;
+
+  if (phone) {
+    message += ` from ${phone}`;
+  }
+
+  if (formattedDate) {
+    message += ` on ${formattedDate}`;
+  }
+
+  message += ".";
+
+  if (invoiceNumber) {
+    message += ` Applied to invoice ${invoiceNumber}.`;
+  }
+
+  return message;
+}
+
 async function autoRecordPayment(
   txData,
   amount,
-  receipt
+  receipt,
+  phone,
+  transactionDate
 ) {
   if (!txData.invoiceId) {
     console.log(
@@ -326,7 +380,13 @@ async function autoRecordPayment(
 
         referenceCode: receipt,
 
-        message: `M-Pesa STK Push - ${receipt}`,
+        message: buildMpesaConfirmationMessage({
+          receipt,
+          amount,
+          phone,
+          transactionDate,
+          invoiceNumber: invoiceData.invoiceNumber,
+        }),
 
         depositDate:
           admin.firestore.FieldValue.serverTimestamp(),
@@ -602,7 +662,9 @@ app.post("/api/mpesa/callback", async (req, res) => {
       await autoRecordPayment(
         txData,
         callbackAmount || txData.amount,
-        receipt
+        receipt,
+        phone || txData.phone,
+        transactionDate
       );
     } else {
       await db
