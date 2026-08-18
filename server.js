@@ -891,8 +891,17 @@ app.post(
         "========== C2B V2 URL REGISTRATION =========="
       );
 
+      // IMPORTANT: C2B validation/confirmation fires based on which
+      // shortcode the money actually lands on. For a Buy Goods Till,
+      // that's PARTY_B (the till number customers pay to directly) -
+      // NOT SHORTCODE, which is the separate "Lipa Na M-Pesa Online"
+      // shortcode used only for STK Push password/auth. Registering
+      // against SHORTCODE means Safaricom never calls our validation/
+      // confirmation URLs for a real Till payment. C2B_SHORTCODE lets
+      // this be overridden explicitly if the two are ever the same
+      // shortcode (Paybill-style setups) or the till changes.
       const shortCode =
-        process.env.SHORTCODE;
+        process.env.C2B_SHORTCODE || process.env.PARTY_B;
 
       const validationURL =
         process.env.C2B_VALIDATION_URL;
@@ -903,7 +912,8 @@ app.post(
       if (!shortCode) {
         return res.status(500).json({
           success: false,
-          error: "SHORTCODE is not configured",
+          error:
+            "C2B_SHORTCODE/PARTY_B is not configured - this must be the actual Till number customers pay to",
         });
       }
 
@@ -1218,7 +1228,13 @@ app.post(
           transactionId: TransID,
           transactionTime: TransTime || null,
           amount,
-          businessShortCode: BusinessShortCode || process.env.SHORTCODE,
+          // Fallback only - Safaricom always sends this in practice.
+          // Defaults to the Till (PARTY_B), not the STK-only SHORTCODE,
+          // since that's what a real C2B payment actually landed on.
+          businessShortCode:
+            BusinessShortCode ||
+            process.env.C2B_SHORTCODE ||
+            process.env.PARTY_B,
           billRefNumber: BillRefNumber || "",
           invoiceNumber: InvoiceNumber || "",
           organizationAccountBalance: OrgAccountBalance || "",
