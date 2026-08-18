@@ -311,49 +311,76 @@ function buildMpesaConfirmationMessage({
   return message;
 }
 
-async function autoRecordPayment(
-  txData,
+// ============================================================
+// SHARED PAYMENT RECORDING (used by BOTH the STK callback and
+// the C2B confirmation handler)
+// ============================================================
+//
+// IMPORTANT: paymentStatus values MUST match the Flutter
+// PaymentStatus enum's .name exactly ("unpaid" / "partiallyPaid"
+// / "paid"). This previously wrote "partially_paid" (snake_case),
+// which the app's PaymentStatus.fromName() silently fails to
+// match and falls back to "unpaid" - so a payment could be fully
+// recorded (amountPaid updated, receipt saved) while the invoice
+// still displayed as Unpaid in the app. That was a real,
+// confirmed bug affecting every partially-paid STK/C2B payment.
+//
+async function recordMpesaPayment({
+  invoiceId,
   amount,
   receipt,
   phone,
-  transactionDate
-) {
-  if (!txData.invoiceId) {
+  transactionDate,
+  source, // "stk" | "c2b"
+  extra = {},
+}) {
+  if (!invoiceId) {
     console.log(
-      "No invoiceId linked to transaction - skipping auto-record"
+      "No invoiceId available - skipping invoice auto-record (payment is still saved in " +
+        (source === "c2b" ? "c2b_transactions" : "transactions") +
+        ")"
     );
 
-    return;
+    return { recorded: false, reason: "no_invoice_id" };
   }
 
-  try {
-    const invoiceRef = db
-      .collection("invoices")
-      .doc(txData.invoiceId);
+  const invoiceRef = db.collection("invoices").doc(invoiceId);
 
-    // Firestore transaction prevents double-counting
-    // when Safaricom retries a callback.
+  let outcome = { recorded: false, reason: "unknown" };
+
+  try {
+    // Firestore transaction prevents double-counting when Safaricom
+    // retries a callback (re-reads the invoice fresh on every attempt).
     await db.runTransaction(async (transaction) => {
-      const invoiceDoc =
-        await transaction.get(invoiceRef);
+      const invoiceDoc = await transaction.get(invoiceRef);
 
       if (!invoiceDoc.exists) {
-        console.error(
-          "Invoice not found:",
-          txData.invoiceId
-        );
-
+        console.error("Invoice not found:", invoiceId);
+        outcome = { recorded: false, reason: "invoice_not_found" };
         return;
       }
 
       const invoiceData = invoiceDoc.data();
+      const existingPayments = invoiceData.payments || [];
 
-      const currentAmountPaid =
-        invoiceData.amountPaid || 0;
+      // Idempotency guard #2: even if the STK/C2B-level dedupe check
+      // was bypassed somehow, never apply the same M-Pesa receipt to
+      // an invoice twice.
+      const alreadyRecorded = existingPayments.some(
+        (p) => p.reference === receipt
+      );
 
-      const newAmountPaid =
-        currentAmountPaid + amount;
+      if (alreadyRecorded) {
+        console.log(
+          "Receipt already recorded on this invoice - skipping duplicate:",
+          receipt
+        );
+        outcome = { recorded: false, reason: "duplicate_receipt" };
+        return;
+      }
 
+      const currentAmountPaid = invoiceData.amountPaid || 0;
+      const newAmountPaid = currentAmountPaid + amount;
       const total = invoiceData.total;
 
       let paymentStatus = "unpaid";
@@ -361,7 +388,7 @@ async function autoRecordPayment(
       if (newAmountPaid >= total) {
         paymentStatus = "paid";
       } else if (newAmountPaid > 0) {
-        paymentStatus = "partially_paid";
+        paymentStatus = "partiallyPaid";
       }
 
       // Create reconciliation record
@@ -370,14 +397,12 @@ async function autoRecordPayment(
         .doc();
 
       transaction.set(reconciliationRef, {
-        invoiceId: txData.invoiceId,
+        invoiceId,
         invoiceNumber: invoiceData.invoiceNumber,
         customerName: invoiceData.customerName,
 
         paymentMethod: "mpesa",
-
-        amount: amount,
-
+        amount,
         referenceCode: receipt,
 
         message: buildMpesaConfirmationMessage({
@@ -388,84 +413,162 @@ async function autoRecordPayment(
           invoiceNumber: invoiceData.invoiceNumber,
         }),
 
-        depositDate:
-          admin.firestore.FieldValue.serverTimestamp(),
+        depositDate: admin.firestore.FieldValue.serverTimestamp(),
 
         reconciled: true,
-
         reconciledByUid: "system",
         reconciledByName:
-          "M-Pesa Auto-Reconciliation",
-
-        reconciledAt:
-          admin.firestore.FieldValue.serverTimestamp(),
+          source === "c2b"
+            ? "M-Pesa Auto-Reconciliation (Till/C2B)"
+            : "M-Pesa Auto-Reconciliation (STK Push)",
+        reconciledAt: admin.firestore.FieldValue.serverTimestamp(),
 
         recordedByUid: "system",
-        recordedByName: "M-Pesa STK Push",
+        recordedByName:
+          source === "c2b" ? "M-Pesa C2B" : "M-Pesa STK Push",
 
-        createdAt:
-          admin.firestore.FieldValue.serverTimestamp(),
+        source,
+        ...extra,
+
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-
-      // Update invoice
-      const existingPayments =
-        invoiceData.payments || [];
 
       const newPayment = {
         reference: receipt,
-        amount: amount,
+        amount,
         date: new Date(),
         paymentMethod: "mpesa",
       };
 
       transaction.update(invoiceRef, {
         amountPaid: newAmountPaid,
-
-        paymentStatus: paymentStatus,
-
+        paymentStatus,
         mpesaReceiptNumber: receipt,
-
-        mpesaCheckoutRequestId:
-          txData.checkoutRequestID,
-
-        paymentDate:
-          admin.firestore.FieldValue.serverTimestamp(),
-
-        payments: [
-          ...existingPayments,
-          newPayment,
-        ],
-
-        updatedAt:
-          admin.firestore.FieldValue.serverTimestamp(),
+        ...(extra.checkoutRequestID
+          ? { mpesaCheckoutRequestId: extra.checkoutRequestID }
+          : {}),
+        paymentDate: admin.firestore.FieldValue.serverTimestamp(),
+        payments: [...existingPayments, newPayment],
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      console.log(
-        "✅ Auto-recorded payment for invoice:",
-        txData.invoiceId
-      );
-
-      console.log(
-        "   Amount: KSh",
-        amount
-      );
-
-      console.log(
-        "   New amount paid: KSh",
-        newAmountPaid
-      );
-
-      console.log(
-        "   Status:",
-        paymentStatus
-      );
+      outcome = {
+        recorded: true,
+        newAmountPaid,
+        paymentStatus,
+        invoiceNumber: invoiceData.invoiceNumber,
+      };
     });
+
+    if (outcome.recorded) {
+      console.log("✅ Auto-recorded payment for invoice:", invoiceId);
+      console.log("   Amount: KSh", amount);
+      console.log("   New amount paid: KSh", outcome.newAmountPaid);
+      console.log("   Status:", outcome.paymentStatus);
+    }
+
+    return outcome;
   } catch (err) {
-    console.error(
-      "Error auto-recording payment:",
-      err
-    );
+    console.error("Error auto-recording payment:", err);
+    return { recorded: false, reason: "error", error: err.message };
   }
+}
+
+// ============================================================
+// C2B INVOICE MATCHING
+// ============================================================
+//
+// A C2B (Till/Buy Goods) payment does NOT originate from an STK
+// Push request, so there is no CheckoutRequestID to look up - the
+// "transactions" collection (keyed by CheckoutRequestID) is not
+// usable here. Safaricom also does not reliably deliver a
+// customer-entered account/reference for Buy Goods Till payments
+// the way it does for Paybill (BillRefNumber for Till is often
+// just the payer's MSISDN or blank).
+//
+// Matching strategy, in order:
+//   1. BillRefNumber looks like an explicit invoice reference
+//      (e.g. "INV-<firestoreDocId>", matching the AccountReference
+//      the app sends on STK Push) -> direct doc lookup, or exact
+//      match against the invoice's invoiceNumber field.
+//   2. Exact balance-due match against open (unpaid/partiallyPaid)
+//      invoices - mirrors the amount-first matching strategy the
+//      Flutter app already uses for Equity SMS reconciliation
+//      (see sms_payment_service.dart _matchInvoice).
+//   3. If more than one invoice has that exact balance due, narrow
+//      by comparing the payer's MSISDN against the invoice's
+//      customerPhone.
+//   4. Otherwise: no confident match. The raw payment is still
+//      saved (c2b_transactions) and a flagged, unreconciled
+//      payment_reconciliations entry is created so it shows up in
+//      the app's existing Reconciliation screen for manual review
+//      - it is never silently dropped, and no invoice is guessed.
+//
+function normalizePhoneForMatch(phone) {
+  if (!phone) return "";
+  const digits = String(phone).replace(/\D/g, "");
+  return digits.length >= 9 ? digits.slice(-9) : digits;
+}
+
+async function findInvoiceForC2B({ billRefNumber, amount, msisdn }) {
+  const ref = (billRefNumber || "").trim();
+
+  if (ref) {
+    if (/^INV-/i.test(ref)) {
+      const candidateId = ref.replace(/^INV-/i, "").trim();
+
+      if (candidateId) {
+        const doc = await db.collection("invoices").doc(candidateId).get();
+
+        if (doc.exists) {
+          return { invoice: doc, strategy: "billRefNumber_docId" };
+        }
+      }
+    }
+
+    const byNumber = await db
+      .collection("invoices")
+      .where("invoiceNumber", "==", ref)
+      .limit(2)
+      .get();
+
+    if (byNumber.size === 1) {
+      return { invoice: byNumber.docs[0], strategy: "billRefNumber_invoiceNumber" };
+    }
+  }
+
+  const openInvoices = await db
+    .collection("invoices")
+    .where("paymentStatus", "in", ["unpaid", "partiallyPaid"])
+    .get();
+
+  const amountCandidates = openInvoices.docs.filter((doc) => {
+    const data = doc.data();
+    const balanceDue = (data.total || 0) - (data.amountPaid || 0);
+    return Math.abs(balanceDue - amount) < 0.5;
+  });
+
+  if (amountCandidates.length === 1) {
+    return { invoice: amountCandidates[0], strategy: "amount" };
+  }
+
+  if (amountCandidates.length > 1 && msisdn) {
+    const normalizedMsisdn = normalizePhoneForMatch(msisdn);
+
+    const phoneNarrowed = amountCandidates.filter((doc) => {
+      const phone = doc.data().customerPhone;
+      return phone && normalizePhoneForMatch(phone) === normalizedMsisdn;
+    });
+
+    if (phoneNarrowed.length === 1) {
+      return { invoice: phoneNarrowed[0], strategy: "amount_and_phone" };
+    }
+  }
+
+  return {
+    invoice: null,
+    strategy: amountCandidates.length > 1 ? "ambiguous" : "no_match",
+  };
 }
 
 
@@ -649,23 +752,40 @@ app.post("/api/mpesa/callback", async (req, res) => {
           validated: true,
         });
 
-      console.log(
-        "✅ STK Payment successful:",
-        receipt
-      );
+      const finalAmount = callbackAmount || txData.amount;
+      const finalPhone = phone || txData.phone;
 
-      console.log(
-        "   Invoice ID:",
-        txData.invoiceId || "N/A"
-      );
+      console.log("========== STK PAYMENT ==========");
+      console.log("CheckoutRequestID:", CheckoutRequestID);
+      console.log("Invoice:", txData.invoiceId || "N/A");
+      console.log("Amount:", finalAmount);
+      console.log("Phone:", finalPhone);
+      console.log("M-PESA Receipt:", receipt);
+      console.log("ResultCode:", ResultCode);
 
-      await autoRecordPayment(
-        txData,
-        callbackAmount || txData.amount,
+      // Respond to Safaricom immediately - it expects a fast ack and
+      // will retry the callback if this handler is slow. The invoice
+      // write (Firestore transaction + reconciliation record) is not
+      // needed to acknowledge the callback, so it runs after we've
+      // already responded.
+      res.json({
+        ResultCode: 0,
+        ResultDesc: "Accepted",
+      });
+
+      recordMpesaPayment({
+        invoiceId: txData.invoiceId,
+        amount: finalAmount,
         receipt,
-        phone || txData.phone,
-        transactionDate
+        phone: finalPhone,
+        transactionDate,
+        source: "stk",
+        extra: { checkoutRequestID: CheckoutRequestID },
+      }).catch((err) =>
+        console.error("Error auto-recording STK payment:", err)
       );
+
+      return;
     } else {
       await db
         .collection("transactions")
@@ -681,10 +801,13 @@ app.post("/api/mpesa/callback", async (req, res) => {
             admin.firestore.FieldValue.serverTimestamp(),
         });
 
-      console.log(
-        "❌ STK Payment failed:",
-        ResultDesc
-      );
+      console.log("========== STK PAYMENT ==========");
+      console.log("CheckoutRequestID:", CheckoutRequestID);
+      console.log("Invoice:", txData.invoiceId || "N/A");
+      console.log("Amount:", txData.amount);
+      console.log("Phone:", txData.phone);
+      console.log("M-PESA Receipt: N/A");
+      console.log("ResultCode:", ResultCode, "-", ResultDesc);
     }
 
     res.json({
@@ -1019,20 +1142,9 @@ app.post(
 app.post(
   "/api/c2b/confirmation",
   async (req, res) => {
+    let responded = false;
+
     try {
-      console.log(
-        "========== C2B CONFIRMATION =========="
-      );
-
-      console.log(
-        "C2B Confirmation Payload:",
-        JSON.stringify(
-          req.body,
-          null,
-          2
-        )
-      );
-
       const {
         TransactionType,
         TransID,
@@ -1049,91 +1161,33 @@ app.post(
         LastName,
       } = req.body;
 
-      console.log(
-        "Transaction Type:",
-        TransactionType
-      );
+      const customerName = `${FirstName || ""} ${
+        MiddleName || ""
+      } ${LastName || ""}`.trim();
 
-      console.log(
-        "M-PESA Receipt:",
-        TransID
-      );
-
-      console.log(
-        "Amount:",
-        TransAmount
-      );
-
-      console.log(
-        "Bill Reference:",
-        BillRefNumber
-      );
-
-      console.log(
-        "Phone:",
-        MSISDN
-      );
-
-      console.log(
-        "Transaction Time:",
-        TransTime
-      );
-
-      console.log(
-        "Customer:",
-        `${FirstName || ""} ${
-          MiddleName || ""
-        } ${LastName || ""}`.trim()
-      );
-
+      console.log("========== C2B PAYMENT ==========");
+      console.log("TransID:", TransID);
+      console.log("TransTime:", TransTime);
+      console.log("Amount:", TransAmount);
+      console.log("MSISDN:", MSISDN);
+      console.log("BillRefNumber:", BillRefNumber);
+      console.log("BusinessShortCode:", BusinessShortCode);
 
       // --------------------------------------------------------
       // BASIC VALIDATION
       // --------------------------------------------------------
-
-      if (!TransID) {
-        console.error(
-          "C2B confirmation missing TransID"
-        );
-
-        return res.json({
-          ResultCode: 1,
-          ResultDesc:
-            "Missing transaction ID",
-        });
-      }
-
-      if (!TransAmount) {
-        console.error(
-          "C2B confirmation missing TransAmount"
-        );
-
-        return res.json({
-          ResultCode: 1,
-          ResultDesc:
-            "Missing transaction amount",
-        });
-      }
-
-
-      // --------------------------------------------------------
-      // DUPLICATE CHECK
-      // --------------------------------------------------------
       //
-      // Safaricom may retry callbacks.
-      // We don't want the same payment saved twice.
+      // NOTE: this is the CONFIRMATION callback - Safaricom has
+      // already completed the transaction by the time it calls
+      // this endpoint. A non-zero ResultCode here does NOT reverse
+      // the payment; it only tells Safaricom our system didn't
+      // acknowledge it, which just causes pointless retries. So we
+      // always return ResultCode 0 from this endpoint and instead
+      // rely on our own logs/Firestore records to flag problems.
       //
-
-      const existingPayment =
-        await db
-          .collection("c2b_transactions")
-          .doc(TransID)
-          .get();
-
-      if (existingPayment.exists) {
-        console.log(
-          "⚠️ C2B transaction already exists:",
-          TransID
+      if (!TransID || !TransAmount) {
+        console.error(
+          "C2B confirmation missing TransID or TransAmount - cannot process, but acknowledging so Safaricom does not retry indefinitely"
         );
 
         return res.json({
@@ -1142,139 +1196,169 @@ app.post(
         });
       }
 
+      const amount = parseFloat(TransAmount);
+      const c2bRef = db.collection("c2b_transactions").doc(TransID);
 
       // --------------------------------------------------------
-      // SAVE C2B TRANSACTION TO FIRESTORE
-      // --------------------------------------------------------
-
-      const c2bTransaction = {
-        transactionType:
-          TransactionType || "Pay Bill",
-
-        mpesaReceiptNumber:
-          TransID,
-
-        transactionId:
-          TransID,
-
-        transactionTime:
-          TransTime || null,
-
-        amount:
-          parseFloat(TransAmount),
-
-        businessShortCode:
-          BusinessShortCode ||
-          process.env.SHORTCODE,
-
-        billRefNumber:
-          BillRefNumber || "",
-
-        invoiceNumber:
-          InvoiceNumber || "",
-
-        organizationAccountBalance:
-          OrgAccountBalance || "",
-
-        thirdPartyTransactionId:
-          ThirdPartyTransID || "",
-
-        phone:
-          MSISDN || "",
-
-        firstName:
-          FirstName || "",
-
-        middleName:
-          MiddleName || "",
-
-        lastName:
-          LastName || "",
-
-        customerName:
-          `${FirstName || ""} ${
-            MiddleName || ""
-          } ${LastName || ""}`.trim(),
-
-        paymentMethod:
-          "mpesa_c2b",
-
-        source:
-          "Safaricom C2B v2",
-
-        status:
-          "confirmed",
-
-        createdAt:
-          admin.firestore.FieldValue.serverTimestamp(),
-
-        receivedAt:
-          admin.firestore.FieldValue.serverTimestamp(),
-      };
-
-
-      await db
-        .collection("c2b_transactions")
-        .doc(TransID)
-        .set(c2bTransaction);
-
-
-      console.log(
-        "✅ C2B TRANSACTION SAVED TO FIRESTORE"
-      );
-
-      console.log(
-        "   M-PESA Code:",
-        TransID
-      );
-
-      console.log(
-        "   Amount: KSh",
-        TransAmount
-      );
-
-      console.log(
-        "   Phone:",
-        MSISDN
-      );
-
-      console.log(
-        "   Reference:",
-        BillRefNumber
-      );
-
-
-      // --------------------------------------------------------
-      // OPTIONAL INVOICE MATCHING
+      // ATOMIC DUPLICATE CHECK
       // --------------------------------------------------------
       //
-      // If BillRefNumber contains an invoice ID/reference,
-      // you can later automatically link this payment to
-      // your invoice.
+      // Safaricom may retry this callback. .create() fails with
+      // ALREADY_EXISTS if the doc is already there, so this is a
+      // single atomic check-and-write instead of a get() + set()
+      // (which has a race window between the two calls).
       //
-      // Example:
-      //
-      // INV-12345
-      //
-      // For now we only save the C2B transaction.
-      // --------------------------------------------------------
+      try {
+        await c2bRef.create({
+          transactionType: TransactionType || "Pay Bill",
+          mpesaReceiptNumber: TransID,
+          transactionId: TransID,
+          transactionTime: TransTime || null,
+          amount,
+          businessShortCode: BusinessShortCode || process.env.SHORTCODE,
+          billRefNumber: BillRefNumber || "",
+          invoiceNumber: InvoiceNumber || "",
+          organizationAccountBalance: OrgAccountBalance || "",
+          thirdPartyTransactionId: ThirdPartyTransID || "",
+          phone: MSISDN || "",
+          firstName: FirstName || "",
+          middleName: MiddleName || "",
+          lastName: LastName || "",
+          customerName,
+          paymentMethod: "mpesa_c2b",
+          source: "Safaricom C2B v2",
+          status: "confirmed",
+          matched: false,
+          matchedInvoiceId: null,
+          matchStrategy: null,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (err) {
+        const alreadyExists =
+          err.code === 6 || // gRPC ALREADY_EXISTS status code
+          /already exists/i.test(err.message || "");
 
+        if (alreadyExists) {
+          console.log(
+            "⚠️ C2B transaction already exists - duplicate callback:",
+            TransID
+          );
 
-      return res.json({
+          return res.json({
+            ResultCode: 0,
+            ResultDesc: "Accepted",
+          });
+        }
+
+        throw err;
+      }
+
+      // Respond to Safaricom immediately once the payment is durably
+      // saved - invoice matching/recording continues below without
+      // making Safaricom wait for it.
+      res.json({
         ResultCode: 0,
         ResultDesc: "Accepted",
       });
+      responded = true;
 
+      (async () => {
+        let firestoreResult = "unknown";
+        let matchedInvoiceId = null;
+
+        try {
+          const { invoice, strategy } = await findInvoiceForC2B({
+            billRefNumber: BillRefNumber,
+            amount,
+            msisdn: MSISDN,
+          });
+
+          if (invoice) {
+            matchedInvoiceId = invoice.id;
+
+            const result = await recordMpesaPayment({
+              invoiceId: invoice.id,
+              amount,
+              receipt: TransID,
+              phone: MSISDN,
+              transactionDate: TransTime,
+              source: "c2b",
+              extra: {
+                transId: TransID,
+                billRefNumber: BillRefNumber || "",
+                businessShortCode:
+                  BusinessShortCode || process.env.SHORTCODE,
+              },
+            });
+
+            await c2bRef.update({
+              matched: !!result.recorded,
+              matchedInvoiceId: invoice.id,
+              matchStrategy: strategy,
+            });
+
+            firestoreResult = result.recorded
+              ? `matched invoice ${invoice.id} via ${strategy}, invoice updated`
+              : `matched invoice ${invoice.id} via ${strategy}, but not recorded (${result.reason})`;
+          } else {
+            await c2bRef.update({ matched: false, matchStrategy: strategy });
+
+            // Never silently drop an unmatched payment: flag it in the
+            // same payment_reconciliations collection the app's existing
+            // Reconciliation screen already displays, so staff can find
+            // and manually link it to the right invoice.
+            await db.collection("payment_reconciliations").add({
+              invoiceId: "",
+              invoiceNumber: "UNMATCHED",
+              customerName: customerName || "Unknown",
+              paymentMethod: "mpesa",
+              amount,
+              referenceCode: TransID,
+              message: `Unmatched Till/C2B payment (${strategy}). BillRef: ${
+                BillRefNumber || "N/A"
+              }, Phone: ${MSISDN || "N/A"}.`,
+              depositDate: admin.firestore.FieldValue.serverTimestamp(),
+              reconciled: false,
+              flagged: true,
+              reviewNote:
+                "Auto-received C2B/Till payment could not be matched to an invoice automatically. Please match manually.",
+              recordedByUid: "system",
+              recordedByName: "M-Pesa C2B",
+              source: "c2b",
+              transId: TransID,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+
+            firestoreResult = `unmatched (${strategy}) - flagged in payment_reconciliations for manual review`;
+          }
+        } catch (err) {
+          console.error("❌ C2B async matching/recording error:", err);
+          firestoreResult = `error: ${err.message}`;
+
+          try {
+            await c2bRef.update({
+              matched: false,
+              matchStrategy: "error",
+              processingError: err.message,
+            });
+          } catch (_) {}
+        }
+
+        console.log("========== C2B PAYMENT ==========");
+        console.log("TransID:", TransID);
+        console.log("Invoice/Reference:", matchedInvoiceId || "none");
+        console.log("Firestore result:", firestoreResult);
+      })();
     } catch (err) {
-      console.error(
-        "❌ C2B confirmation error:",
-        err
-      );
+      console.error("❌ C2B confirmation error:", err);
 
-      return res.status(500).json({
-        ResultCode: 1,
-        ResultDesc: "Error",
-      });
+      if (!responded) {
+        return res.json({
+          ResultCode: 0,
+          ResultDesc: "Accepted",
+        });
+      }
     }
   }
 );
