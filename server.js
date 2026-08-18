@@ -696,7 +696,7 @@ async function getMpesaAccessToken() {
 //
 
 app.post(
-  "/api/mpesa/c2b/register",
+  "/api/c2b/register",
   async (req, res) => {
     try {
       console.log(
@@ -831,11 +831,11 @@ app.post(
 // when external validation is enabled.
 //
 // URL:
-// /api/mpesa/c2b/validation
+// /api/c2b/validation
 //
 
 app.post(
-  "/api/mpesa/c2b/validation",
+  "/api/c2b/validation",
   async (req, res) => {
     try {
       console.log(
@@ -951,11 +951,11 @@ app.post(
 // This is the important endpoint for your Selete Agro system.
 //
 // URL:
-// /api/mpesa/c2b/confirmation
+// /api/c2b/confirmation
 //
 
 app.post(
-  "/api/mpesa/c2b/confirmation",
+  "/api/c2b/confirmation",
   async (req, res) => {
     try {
       console.log(
