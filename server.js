@@ -716,11 +716,14 @@ app.post("/api/mpesa/callback", async (req, res) => {
         );
       }
 
-      // Validate phone
+      // Validate phone. Safaricom's callback returns PhoneNumber as a
+      // number, while txData.phone was stored as the string from the
+      // original request body - compare as strings so a genuinely
+      // identical phone number never logs as a false "mismatch".
       if (
         phone &&
         txData.phone &&
-        phone !== txData.phone
+        String(phone) !== String(txData.phone)
       ) {
         console.error(
           "Phone mismatch - Expected:",
