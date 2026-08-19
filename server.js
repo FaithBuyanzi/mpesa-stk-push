@@ -5,7 +5,6 @@ const cors = require("cors");
 const axios = require("axios");
 const { admin, db } = require("./firebase");
 const { stkPush, stkQuery } = require("./mpesa");
-const { buildSecurityCredential } = require("./security_credential");
 
 const app = express();
 
@@ -1388,10 +1387,17 @@ app.post(
 // ============================================================
 //
 // Unlike STK Push and C2B, this uses Safaricom's Initiator-based
-// security model (Initiator name/password -> encrypted
-// SecurityCredential - see security_credential.js) instead of just the
-// OAuth consumer key/secret. The OAuth token itself IS reused from
+// security model (Initiator name/password) instead of just the OAuth
+// consumer key/secret. The OAuth token itself IS reused from
 // getMpesaAccessToken() above, same as C2B registration.
+//
+// IMPORTANT: SecurityCredential is supposed to be the Initiator
+// password RSA-encrypted against Safaricom's public certificate - the
+// certificate-based encryption step has been removed at the account
+// owner's request, so this currently sends the raw password instead.
+// Safaricom is expected to reject real requests because of this (see
+// the note further down) - it is not expected to actually return a
+// balance right now.
 //
 // This is a two-step, ASYNC flow, same shape as STK Push:
 //   1. POST here -> Safaricom immediately acknowledges the request
@@ -1443,20 +1449,23 @@ app.post("/api/mpesa/account-balance", async (req, res) => {
       });
     }
 
-    let securityCredential;
-    try {
-      securityCredential = buildSecurityCredential();
-    } catch (err) {
-      console.error(
-        "Failed to build SecurityCredential:",
-        err.message
-      );
-
+    if (!process.env.INITIATOR_PASSWORD) {
       return res.status(500).json({
         success: false,
-        error: err.message,
+        error: "INITIATOR_PASSWORD is not configured",
       });
     }
+
+    // NOT correctly encrypted - Safaricom's SecurityCredential field is
+    // supposed to be the Initiator password RSA-encrypted against their
+    // public certificate (see the removed security_credential.js). At
+    // the account owner's request, that step has been removed - this
+    // sends the raw password instead of the encrypted value, so
+    // Safaricom is expected to reject the request (likely error 18,
+    // "Initiator Credential Check Failure") rather than accept it. This
+    // gets the request past local validation so you can see Safaricom's
+    // actual response instead of a local "certificate not found" error.
+    const securityCredential = process.env.INITIATOR_PASSWORD;
 
     const accessToken = await getMpesaAccessToken();
 
