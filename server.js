@@ -5,6 +5,7 @@ const cors = require("cors");
 const axios = require("axios");
 const { admin, db } = require("./firebase");
 const { stkPush, stkQuery } = require("./mpesa");
+const { buildSecurityCredential } = require("./security_credential");
 
 const app = express();
 
@@ -22,6 +23,9 @@ const MPESA_OAUTH_URL =
 
 const C2B_REGISTER_URL =
   `${MPESA_BASE_URL}/mpesa/c2b/v2/registerurl`;
+
+const ACCOUNT_BALANCE_URL =
+  `${MPESA_BASE_URL}/mpesa/accountbalance/v1/query`;
 
 
 // ============================================================
@@ -1377,6 +1381,269 @@ app.post(
     }
   }
 );
+
+
+// ============================================================
+// ACCOUNT BALANCE API
+// ============================================================
+//
+// Unlike STK Push and C2B, this uses Safaricom's Initiator-based
+// security model (Initiator name/password -> encrypted
+// SecurityCredential - see security_credential.js) instead of just the
+// OAuth consumer key/secret. The OAuth token itself IS reused from
+// getMpesaAccessToken() above, same as C2B registration.
+//
+// This is a two-step, ASYNC flow, same shape as STK Push:
+//   1. POST here -> Safaricom immediately acknowledges the request
+//      (this does NOT contain the balance).
+//   2. The actual balance arrives later via a callback to
+//      ACCOUNT_BALANCE_RESULT_URL (or ACCOUNT_BALANCE_TIMEOUT_URL if
+//      it times out) - handled below and saved to Firestore.
+//
+// URL:
+// POST /api/mpesa/account-balance
+//
+
+app.post("/api/mpesa/account-balance", async (req, res) => {
+  try {
+    console.log("========== ACCOUNT BALANCE REQUEST ==========");
+
+    const initiatorName = process.env.INITIATOR_NAME;
+
+    // Defaults to SHORTCODE (not PARTY_B/the Till) - the C2B
+    // registration attempt earlier showed this API app is only
+    // authorized for its own shortcode (4363819), not the Till number
+    // directly ("Kindly use your own ShortCode"). Overridable via
+    // ACCOUNT_BALANCE_SHORTCODE if that's ever not the case.
+    const partyA =
+      process.env.ACCOUNT_BALANCE_SHORTCODE || process.env.SHORTCODE;
+
+    const resultURL = process.env.ACCOUNT_BALANCE_RESULT_URL;
+    const timeoutURL = process.env.ACCOUNT_BALANCE_TIMEOUT_URL;
+
+    if (!initiatorName) {
+      return res.status(500).json({
+        success: false,
+        error: "INITIATOR_NAME is not configured",
+      });
+    }
+
+    if (!partyA) {
+      return res.status(500).json({
+        success: false,
+        error: "SHORTCODE/ACCOUNT_BALANCE_SHORTCODE is not configured",
+      });
+    }
+
+    if (!resultURL || !timeoutURL) {
+      return res.status(500).json({
+        success: false,
+        error:
+          "ACCOUNT_BALANCE_RESULT_URL and ACCOUNT_BALANCE_TIMEOUT_URL must both be configured",
+      });
+    }
+
+    let securityCredential;
+    try {
+      securityCredential = buildSecurityCredential();
+    } catch (err) {
+      console.error(
+        "Failed to build SecurityCredential:",
+        err.message
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+
+    const accessToken = await getMpesaAccessToken();
+
+    const payload = {
+      Initiator: initiatorName,
+      SecurityCredential: securityCredential,
+      CommandID: "AccountBalance",
+      PartyA: partyA,
+      IdentifierType: "4",
+      Remarks: "Selete Agro account balance query",
+      QueueTimeOutURL: timeoutURL,
+      ResultURL: resultURL,
+    };
+
+    // Never log SecurityCredential or the access token.
+    console.log("PartyA:", partyA);
+    console.log("Initiator:", initiatorName);
+    console.log("ResultURL:", resultURL);
+    console.log("QueueTimeOutURL:", timeoutURL);
+
+    const response = await axios.post(ACCOUNT_BALANCE_URL, payload, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+
+      timeout: 30000,
+    });
+
+    console.log("Account Balance accept response:", response.data);
+
+    res.json({
+      success: true,
+
+      message:
+        "Request accepted - the actual balance arrives asynchronously at ACCOUNT_BALANCE_RESULT_URL, not in this response",
+
+      data: response.data,
+    });
+  } catch (err) {
+    console.error(
+      "❌ Account balance request error:"
+    );
+
+    console.error(
+      err.response?.data || err.message
+    );
+
+    if (err.code === "ECONNABORTED") {
+      return res.status(504).json({
+        success: false,
+        error: "Timed out waiting for Safaricom to accept the request",
+      });
+    }
+
+    res.status(err.response?.status || 500).json({
+      success: false,
+      error: err.response?.data || err.message,
+    });
+  }
+});
+
+// ============================================================
+// ACCOUNT BALANCE RESULT CALLBACK
+// ============================================================
+//
+// Safaricom calls this asynchronously with the actual balance once the
+// request above has been processed.
+//
+// URL:
+// /api/mpesa/account-balance/result
+//
+
+app.post("/api/mpesa/account-balance/result", async (req, res) => {
+  try {
+    console.log("========== ACCOUNT BALANCE RESULT ==========");
+
+    console.log(JSON.stringify(req.body, null, 2));
+
+    const result = req.body?.Result;
+
+    if (result) {
+      console.log("ResultCode:", result.ResultCode);
+      console.log("ResultDesc:", result.ResultDesc);
+
+      const params = result.ResultParameters?.ResultParameter || [];
+
+      const record = {
+        resultCode: result.ResultCode,
+        resultDesc: result.ResultDesc,
+        raw: result,
+        receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      // Per Safaricom's documented format, AccountBalance is several
+      // accounts joined by "&", each account's own fields joined by
+      // "|": Name|Currency|AvailableBalance|<further fields Safaricom's
+      // docs don't fully define>. e.g.:
+      //   "Working Account|KES|700000.00|700000.00|0.00|0.00&Utility
+      //    Account|KES|228037.00|228037.00|0.00|0.00"
+      // Only name/currency/availableBalance are parsed out with
+      // confidence; the remaining fields are kept as extraAmounts
+      // rather than guessed at, since Safaricom's own docs are
+      // ambiguous about what each one represents beyond "available".
+      const balanceParam = params.find(
+        (p) => p.Key === "AccountBalance"
+      );
+
+      const boCompletedParam = params.find(
+        (p) => p.Key === "BOCompletedTime"
+      );
+
+      if (balanceParam) {
+        record.accountBalanceRaw = balanceParam.Value;
+        console.log("AccountBalance raw value:", balanceParam.Value);
+
+        record.accounts = balanceParam.Value.split("&")
+          .map((entry) => entry.split("|"))
+          .filter((fields) => fields.length >= 3)
+          .map((fields) => ({
+            accountName: fields[0],
+            currency: fields[1],
+            availableBalance: parseFloat(fields[2]) || 0,
+            extraAmounts: fields.slice(3).map((v) => parseFloat(v) || 0),
+          }));
+
+        console.log(
+          "Parsed accounts:",
+          record.accounts
+            .map((a) => `${a.accountName}: ${a.availableBalance} ${a.currency}`)
+            .join(", ")
+        );
+      }
+
+      if (boCompletedParam) {
+        record.boCompletedTime = boCompletedParam.Value;
+      }
+
+      await db
+        .collection("mpesa_account_balance")
+        .doc("latest")
+        .set(record);
+
+      console.log("✅ Account balance result saved to Firestore");
+    } else {
+      console.error(
+        "Account balance result callback missing Result object"
+      );
+    }
+
+    res.json({
+      ResultCode: 0,
+      ResultDesc: "Accepted",
+    });
+  } catch (err) {
+    console.error(
+      "❌ Account balance result error:",
+      err
+    );
+
+    res.status(500).json({
+      ResultCode: 1,
+      ResultDesc: "Error",
+    });
+  }
+});
+
+// ============================================================
+// ACCOUNT BALANCE TIMEOUT CALLBACK
+// ============================================================
+//
+// Safaricom calls this instead of the result callback if the request
+// times out on their end.
+//
+// URL:
+// /api/mpesa/account-balance/timeout
+//
+
+app.post("/api/mpesa/account-balance/timeout", async (req, res) => {
+  console.error("========== ACCOUNT BALANCE TIMEOUT ==========");
+  console.error(JSON.stringify(req.body, null, 2));
+
+  res.json({
+    ResultCode: 0,
+    ResultDesc: "Accepted",
+  });
+});
 
 
 // ============================================================
