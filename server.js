@@ -891,17 +891,16 @@ app.post(
         "========== C2B V2 URL REGISTRATION =========="
       );
 
-      // IMPORTANT: C2B validation/confirmation fires based on which
-      // shortcode the money actually lands on. For a Buy Goods Till,
-      // that's PARTY_B (the till number customers pay to directly) -
-      // NOT SHORTCODE, which is the separate "Lipa Na M-Pesa Online"
-      // shortcode used only for STK Push password/auth. Registering
-      // against SHORTCODE means Safaricom never calls our validation/
-      // confirmation URLs for a real Till payment. C2B_SHORTCODE lets
-      // this be overridden explicitly if the two are ever the same
-      // shortcode (Paybill-style setups) or the till changes.
+      // Confirmed with the account owner: SHORTCODE (4363819) is the
+      // correct shortcode to register C2B against - this is the app's
+      // "own" shortcode Safaricom authorizes it for. PARTY_B (4363881,
+      // the Till customers pay to directly) is only used as the STK
+      // Push payment destination, not for C2B registration - trying to
+      // register against PARTY_B was rejected by Safaricom with
+      // "400.003.02 Kindly use your own ShortCode". C2B_SHORTCODE
+      // remains available as an explicit override if that ever changes.
       const shortCode =
-        process.env.C2B_SHORTCODE || process.env.PARTY_B;
+        process.env.C2B_SHORTCODE || process.env.SHORTCODE;
 
       const validationURL =
         process.env.C2B_VALIDATION_URL;
@@ -912,8 +911,7 @@ app.post(
       if (!shortCode) {
         return res.status(500).json({
           success: false,
-          error:
-            "C2B_SHORTCODE/PARTY_B is not configured - this must be the actual Till number customers pay to",
+          error: "SHORTCODE is not configured",
         });
       }
 
@@ -1229,12 +1227,10 @@ app.post(
           transactionTime: TransTime || null,
           amount,
           // Fallback only - Safaricom always sends this in practice.
-          // Defaults to the Till (PARTY_B), not the STK-only SHORTCODE,
-          // since that's what a real C2B payment actually landed on.
           businessShortCode:
             BusinessShortCode ||
             process.env.C2B_SHORTCODE ||
-            process.env.PARTY_B,
+            process.env.SHORTCODE,
           billRefNumber: BillRefNumber || "",
           invoiceNumber: InvoiceNumber || "",
           organizationAccountBalance: OrgAccountBalance || "",
