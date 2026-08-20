@@ -5,6 +5,7 @@ const cors = require("cors");
 const axios = require("axios");
 const { admin, db } = require("./firebase");
 const { stkPush, stkQuery } = require("./mpesa");
+const { buildSecurityCredential } = require("./security_credential");
 
 const app = express();
 
@@ -1391,13 +1392,9 @@ app.post(
 // consumer key/secret. The OAuth token itself IS reused from
 // getMpesaAccessToken() above, same as C2B registration.
 //
-// IMPORTANT: SecurityCredential is supposed to be the Initiator
-// password RSA-encrypted against Safaricom's public certificate - the
-// certificate-based encryption step has been removed at the account
-// owner's request, so this currently sends the raw password instead.
-// Safaricom is expected to reject real requests because of this (see
-// the note further down) - it is not expected to actually return a
-// balance right now.
+// SecurityCredential is the Initiator password RSA-encrypted against
+// Safaricom's public certificate (certs/ProductionCertificate.cer),
+// base64-encoded - built fresh per-request in security_credential.js.
 //
 // This is a two-step, ASYNC flow, same shape as STK Push:
 //   1. POST here -> Safaricom immediately acknowledges the request
@@ -1456,16 +1453,18 @@ app.post("/api/mpesa/account-balance", async (req, res) => {
       });
     }
 
-    // NOT correctly encrypted - Safaricom's SecurityCredential field is
-    // supposed to be the Initiator password RSA-encrypted against their
-    // public certificate (see the removed security_credential.js). At
-    // the account owner's request, that step has been removed - this
-    // sends the raw password instead of the encrypted value, so
-    // Safaricom is expected to reject the request (likely error 18,
-    // "Initiator Credential Check Failure") rather than accept it. This
-    // gets the request past local validation so you can see Safaricom's
-    // actual response instead of a local "certificate not found" error.
-    const securityCredential = process.env.INITIATOR_PASSWORD;
+    let securityCredential;
+    try {
+      securityCredential = buildSecurityCredential(
+        process.env.INITIATOR_PASSWORD
+      );
+    } catch (credErr) {
+      console.error("Failed to build SecurityCredential:", credErr.message);
+      return res.status(500).json({
+        success: false,
+        error: `Failed to build SecurityCredential: ${credErr.message}`,
+      });
+    }
 
     const accessToken = await getMpesaAccessToken();
 
