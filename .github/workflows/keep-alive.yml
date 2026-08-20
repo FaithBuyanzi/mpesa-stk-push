@@ -1,0 +1,19 @@
+name: Keep backend awake (TEMPORARY - C2B testing)
+
+# TEMPORARY measure to stop Render's free-tier service from sleeping,
+# so real C2B/Till payment confirmations aren't missed while we test
+# whether that's actually the issue. Remove this once a permanent fix
+# (e.g. upgrading the Render plan) is decided on - a free ping like
+# this is not a real guarantee for production payment handling.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend to keep it awake
+        run: curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://selete-agro-backend.onrender.com/
