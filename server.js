@@ -895,16 +895,15 @@ app.post(
         "========== C2B V2 URL REGISTRATION =========="
       );
 
-      // Confirmed with the account owner: SHORTCODE (4363819) is the
-      // correct shortcode to register C2B against - this is the app's
-      // "own" shortcode Safaricom authorizes it for. PARTY_B (4363881,
-      // the Till customers pay to directly) is only used as the STK
-      // Push payment destination, not for C2B registration - trying to
+      // Confirmed with the account owner: this is the app's "own"
+      // shortcode Safaricom authorizes it for. PARTY_B (4363881, the
+      // Till customers pay to directly) is only used as the STK Push
+      // payment destination, not for C2B registration - trying to
       // register against PARTY_B was rejected by Safaricom with
-      // "400.003.02 Kindly use your own ShortCode". C2B_SHORTCODE
-      // remains available as an explicit override if that ever changes.
+      // "400.003.02 Kindly use your own ShortCode". Updated from
+      // 4363819 to 4363839 after Safaricom reassigned the shortcode.
       const shortCode =
-        process.env.C2B_SHORTCODE || process.env.SHORTCODE;
+        4363839;
 
       const validationURL =
         process.env.C2B_VALIDATION_URL;
