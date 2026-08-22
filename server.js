@@ -1472,7 +1472,7 @@ app.post("/api/mpesa/account-balance", async (req, res) => {
       SecurityCredential: securityCredential,
       CommandID: "AccountBalance",
       PartyA: partyA,
-      IdentifierType: "4",
+      IdentifierType: "2",
       Remarks: "Selete Agro account balance query",
       QueueTimeOutURL: timeoutURL,
       ResultURL: resultURL,
