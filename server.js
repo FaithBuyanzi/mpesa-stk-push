@@ -1418,7 +1418,7 @@ app.post("/api/mpesa/account-balance", async (req, res) => {
     // directly ("Kindly use your own ShortCode"). Overridable via
     // ACCOUNT_BALANCE_SHORTCODE if that's ever not the case.
     const partyA =
-      process.env.ACCOUNT_BALANCE_SHORTCODE || process.env.SHORTCODE;
+      process.env.ACCOUNT_BALANCE_SHORTCODE || 4363839;
 
     const resultURL = process.env.ACCOUNT_BALANCE_RESULT_URL;
     const timeoutURL = process.env.ACCOUNT_BALANCE_TIMEOUT_URL;
