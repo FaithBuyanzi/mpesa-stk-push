@@ -16,11 +16,22 @@ async function getAccessToken() {
 }
 
 // Step 4: Generate password + timestamp
+//
+// Safaricom validates this Timestamp against its own East Africa Time
+// clock (UTC+3, no DST) when it independently recomputes the Password to
+// authenticate the request. The host server (Render) runs in UTC, so
+// building the timestamp from the server's local/UTC clock silently
+// produces a Password Safaricom rejects - the initial STK push call still
+// returns ResponseCode 0 (the request is well-formed), but the push is
+// never actually generated, and a follow-up query returns ResultCode 4999
+// "Wrong credentials". Shifting by +3h before formatting fixes this
+// regardless of the underlying server's timezone.
 function generatePassword() {
-  const timestamp = new Date()
+  const eatNow = new Date(Date.now() + 3 * 60 * 60 * 1000);
+  const timestamp = eatNow
     .toISOString()
     .replace(/[^0-9]/g, "")
-    .slice(0, 14); // format: YYYYMMDDHHmmss
+    .slice(0, 14); // format: YYYYMMDDHHmmss, East Africa Time
 
   const password = Buffer.from(
     `${process.env.SHORTCODE}${process.env.PASSKEY}${timestamp}`
