@@ -27,6 +27,12 @@ const C2B_REGISTER_URL =
 const ACCOUNT_BALANCE_URL =
   `${MPESA_BASE_URL}/mpesa/accountbalance/v1/query`;
 
+const PULL_REGISTER_URL =
+  `${MPESA_BASE_URL}/pulltransactions/v1/register`;
+
+const PULL_QUERY_URL =
+  `${MPESA_BASE_URL}/pulltransactions/v1/query`;
+
 
 // ============================================================
 // MIDDLEWARE
@@ -335,7 +341,7 @@ async function recordMpesaPayment({
   receipt,
   phone,
   transactionDate,
-  source, // "stk" | "c2b"
+  source, // "stk" | "c2b" | "pull"
   extra = {},
 }) {
   if (!invoiceId) {
@@ -422,14 +428,20 @@ async function recordMpesaPayment({
         reconciled: true,
         reconciledByUid: "system",
         reconciledByName:
-          source === "c2b"
+          source === "pull"
+            ? "M-Pesa Auto-Reconciliation (Pull API Recovery)"
+            : source === "c2b"
             ? "M-Pesa Auto-Reconciliation (Till/C2B)"
             : "M-Pesa Auto-Reconciliation (STK Push)",
         reconciledAt: admin.firestore.FieldValue.serverTimestamp(),
 
         recordedByUid: "system",
         recordedByName:
-          source === "c2b" ? "M-Pesa C2B" : "M-Pesa STK Push",
+          source === "pull"
+            ? "M-Pesa Pull API"
+            : source === "c2b"
+            ? "M-Pesa C2B"
+            : "M-Pesa STK Push",
 
         source,
         ...extra,
@@ -1380,6 +1392,334 @@ app.post(
     }
   }
 );
+
+
+// ============================================================
+// PULL TRANSACTIONS API - REGISTER (reconciliation, C2B only)
+// ============================================================
+//
+// One-time registration (per Safaricom docs) that lets us later query
+// all C2B transactions on our ShortCode from the last 48 hours - used
+// to recover any C2B confirmations that Safaricom's real-time
+// callback (/api/c2b/confirmation) failed to deliver, e.g. during our
+// own downtime.
+//
+// Registers against the same "own" ShortCode used for C2B v2 above
+// (4363839), not PARTY_B/the Till - the Pull API sits on top of the
+// same C2B transactions Safaricom already routes through that code.
+//
+// URL:
+// POST /api/mpesa/pull/register
+//
+
+app.post("/api/mpesa/pull/register", async (req, res) => {
+  try {
+    console.log("========== PULL TRANSACTIONS - REGISTER ==========");
+
+    const shortCode = 4363839;
+    const nominatedNumber = process.env.PULL_NOMINATED_NUMBER;
+    const callbackURL = process.env.PULL_CALLBACK_URL;
+
+    if (!nominatedNumber) {
+      return res.status(500).json({
+        success: false,
+        error: "PULL_NOMINATED_NUMBER is not configured",
+      });
+    }
+
+    if (!callbackURL) {
+      return res.status(500).json({
+        success: false,
+        error: "PULL_CALLBACK_URL is not configured",
+      });
+    }
+
+    console.log("ShortCode:", shortCode);
+    console.log("NominatedNumber:", nominatedNumber);
+    console.log("CallBackURL:", callbackURL);
+
+    const accessToken = await getMpesaAccessToken();
+
+    const payload = {
+      ShortCode: shortCode,
+      RequestType: "Pull",
+      NominatedNumber: nominatedNumber,
+      CallBackURL: callbackURL,
+    };
+
+    const response = await axios.post(PULL_REGISTER_URL, payload, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 30000,
+    });
+
+    console.log("Pull registration response:", response.data);
+
+    // 1000 = registered successfully, 1001 = already registered - both
+    // mean the ShortCode is now set up for pulling, so both are treated
+    // as success by the caller (this endpoint is meant to be safe to
+    // call more than once).
+    res.json({
+      success: true,
+      message:
+        response.data?.ResponseDescription ||
+        "Pull registration request completed",
+      data: response.data,
+    });
+  } catch (err) {
+    console.error("❌ Pull registration error:");
+    console.error(err.response?.data || err.message);
+
+    res.status(err.response?.status || 500).json({
+      success: false,
+      error: err.response?.data || err.message,
+    });
+  }
+});
+
+
+// ============================================================
+// PULL TRANSACTIONS API - QUERY (reconciliation)
+// ============================================================
+//
+// Fetches C2B transactions Safaricom processed on our ShortCode within
+// a given window (max 48 hours back, per Safaricom) and recovers any
+// that never reached /api/c2b/confirmation. Reuses the exact same
+// c2b_transactions doc-ID-by-TransID dedupe as the live confirmation
+// callback (see findInvoiceForC2B/recordMpesaPayment above), so a
+// transaction that already arrived via the real-time callback is left
+// untouched - only genuinely missed ones get inserted and matched here.
+//
+// URL:
+// GET /api/mpesa/pull/query?startDate=2024-01-01 00:00:00&endDate=2024-01-02 00:00:00&offset=0
+//
+
+app.get("/api/mpesa/pull/query", async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const offset = req.query.offset || "0";
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "startDate and endDate query params are required (format: YYYY-MM-DD HH:mm:ss)",
+      });
+    }
+
+    console.log("========== PULL TRANSACTIONS - QUERY ==========");
+    console.log("StartDate:", startDate);
+    console.log("EndDate:", endDate);
+    console.log("Offset:", offset);
+
+    const shortCode = 4363839;
+    const accessToken = await getMpesaAccessToken();
+
+    const payload = {
+      ShortCode: shortCode,
+      StartDate: startDate,
+      EndDate: endDate,
+      OffSetValue: String(offset),
+    };
+
+    // Safaricom's Pull Query endpoint is documented as GET but expects a
+    // JSON request body - axios supports this on a GET request via `data`.
+    const response = await axios({
+      method: "get",
+      url: PULL_QUERY_URL,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      data: payload,
+      timeout: 30000,
+    });
+
+    const responseCode = response.data?.ResponseCode;
+
+    // Safaricom nests results as an array of arrays; flatten defensively.
+    // A missing/empty Response means no transactions for the window
+    // (ResponseCode 1001).
+    const rawTransactions = (response.data?.Response || []).flat();
+
+    console.log(
+      `Pull query returned ${rawTransactions.length} transaction(s), ResponseCode ${responseCode}`
+    );
+
+    const recovered = [];
+    const alreadyKnown = [];
+    const errors = [];
+
+    for (const t of rawTransactions) {
+      const transactionId = t.transactionId;
+
+      if (!transactionId) continue;
+
+      const amount = parseFloat(t.amount) || 0;
+      const c2bRef = db.collection("c2b_transactions").doc(transactionId);
+
+      try {
+        await c2bRef.create({
+          transactionType: t.transactiontype || "Pay Bill",
+          mpesaReceiptNumber: transactionId,
+          transactionId,
+          transactionTime: t.trxDate || null,
+          amount,
+          businessShortCode: shortCode,
+          billRefNumber: t.billreference || "",
+          invoiceNumber: "",
+          organizationAccountBalance: "",
+          thirdPartyTransactionId: "",
+          phone: t.msisdn ? String(t.msisdn) : "",
+          firstName: "",
+          middleName: "",
+          lastName: "",
+          customerName: t.sender || "",
+          paymentMethod: "mpesa_c2b",
+          source: "Safaricom Pull API (recovered)",
+          status: "confirmed",
+          matched: false,
+          matchedInvoiceId: null,
+          matchStrategy: null,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (err) {
+        const alreadyExists =
+          err.code === 6 || // gRPC ALREADY_EXISTS status code
+          /already exists/i.test(err.message || "");
+
+        if (alreadyExists) {
+          alreadyKnown.push(transactionId);
+          continue;
+        }
+
+        console.error(
+          "Error saving pulled transaction:",
+          transactionId,
+          err.message
+        );
+        errors.push({ transactionId, error: err.message });
+        continue;
+      }
+
+      recovered.push(transactionId);
+
+      try {
+        const { invoice, strategy } = await findInvoiceForC2B({
+          billRefNumber: t.billreference,
+          amount,
+          msisdn: t.msisdn,
+        });
+
+        if (invoice) {
+          const result = await recordMpesaPayment({
+            invoiceId: invoice.id,
+            amount,
+            receipt: transactionId,
+            phone: t.msisdn,
+            transactionDate: t.trxDate,
+            source: "pull",
+            extra: {
+              transId: transactionId,
+              billRefNumber: t.billreference || "",
+              businessShortCode: shortCode,
+            },
+          });
+
+          await c2bRef.update({
+            matched: !!result.recorded,
+            matchedInvoiceId: invoice.id,
+            matchStrategy: strategy,
+          });
+        } else {
+          await c2bRef.update({ matched: false, matchStrategy: strategy });
+
+          // Same pattern as the live C2B confirmation handler: never
+          // silently drop a recovered payment that couldn't be matched.
+          await db.collection("payment_reconciliations").add({
+            invoiceId: "",
+            invoiceNumber: "UNMATCHED",
+            customerName: t.sender || "Unknown",
+            paymentMethod: "mpesa",
+            amount,
+            referenceCode: transactionId,
+            message: `Unmatched Pull-recovered C2B payment (${strategy}). BillRef: ${
+              t.billreference || "N/A"
+            }, Phone: ${t.msisdn || "N/A"}.`,
+            depositDate: admin.firestore.FieldValue.serverTimestamp(),
+            reconciled: false,
+            flagged: true,
+            reviewNote:
+              "Recovered via Pull Transactions API - could not be matched to an invoice automatically. Please match manually.",
+            recordedByUid: "system",
+            recordedByName: "M-Pesa Pull API",
+            source: "pull",
+            transId: transactionId,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+      } catch (err) {
+        console.error(
+          "Error matching/recording pulled transaction:",
+          transactionId,
+          err
+        );
+        errors.push({ transactionId, error: err.message });
+      }
+    }
+
+    console.log(
+      `Pull query: ${recovered.length} recovered, ${alreadyKnown.length} already known, ${errors.length} errors`
+    );
+
+    res.json({
+      success: true,
+      responseCode,
+      responseMessage: response.data?.ResponseMessage,
+      totalFetched: rawTransactions.length,
+      recoveredCount: recovered.length,
+      alreadyKnownCount: alreadyKnown.length,
+      recoveredTransactionIds: recovered,
+      errors,
+    });
+  } catch (err) {
+    console.error("❌ Pull query error:");
+    console.error(err.response?.data || err.message);
+
+    res.status(err.response?.status || 500).json({
+      success: false,
+      error: err.response?.data || err.message,
+    });
+  }
+});
+
+
+// ============================================================
+// PULL TRANSACTIONS API - CALLBACK
+// ============================================================
+//
+// CallBackURL is a required field at registration time, but this
+// integration always fetches transactions synchronously via the
+// /api/mpesa/pull/query response above rather than waiting on a push.
+// This endpoint just logs and acknowledges whatever Safaricom sends
+// here so registration/delivery never fails for a missing endpoint.
+//
+// URL:
+// POST /api/mpesa/pull/callback
+//
+
+app.post("/api/mpesa/pull/callback", (req, res) => {
+  console.log("========== PULL TRANSACTIONS - CALLBACK ==========");
+  console.log(JSON.stringify(req.body, null, 2));
+
+  res.json({
+    ResultCode: 0,
+    ResultDesc: "Accepted",
+  });
+});
 
 
 // ============================================================
