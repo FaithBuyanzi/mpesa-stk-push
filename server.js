@@ -292,6 +292,27 @@ function formatMpesaTransactionDate(transactionDate) {
   return `${day}/${month}/${year} ${hour12}:${minute} ${meridiem}`;
 }
 
+// Parses Safaricom's "YYYYMMDDHHmmss" transaction timestamps (TransTime,
+// Pull API trxDate) into a real Date. Returns null if the string isn't in
+// that shape, so callers can fall back to FieldValue.serverTimestamp().
+function parseMpesaTimestamp(str) {
+  const s = String(str || "");
+
+  if (!/^\d{14}$/.test(s)) {
+    return null;
+  }
+
+  const year = s.slice(0, 4);
+  const month = s.slice(4, 6);
+  const day = s.slice(6, 8);
+  const hour = s.slice(8, 10);
+  const minute = s.slice(10, 12);
+  const second = s.slice(12, 14);
+
+  const date = new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}`);
+  return isNaN(date.getTime()) ? null : date;
+}
+
 function buildMpesaConfirmationMessage({
   receipt,
   amount,
@@ -495,96 +516,179 @@ async function recordMpesaPayment({
 // ============================================================
 //
 // A C2B (Till/Buy Goods) payment does NOT originate from an STK
-// Push request, so there is no CheckoutRequestID to look up - the
-// "transactions" collection (keyed by CheckoutRequestID) is not
-// usable here. Safaricom also does not reliably deliver a
-// customer-entered account/reference for Buy Goods Till payments
-// the way it does for Paybill (BillRefNumber for Till is often
-// just the payer's MSISDN or blank).
+// Push request, so there is no CheckoutRequestID to look up, and
+// Safaricom does not reliably deliver a customer-entered
+// account/reference for Buy Goods Till payments (BillRefNumber for
+// Till is often just the payer's MSISDN or blank). So this reuses
+// the exact same amount+name matching strategy the Flutter app
+// already uses for Equity SMS reconciliation - see
+// sms_payment_service.dart _matchInvoice / compute_isolates.dart
+// matchInvoiceCompute, ported here 1:1 (same 0.01 balance-due
+// tolerance, same Levenshtein-based name-similarity scoring, same
+// 75-point strict threshold, same most-recent-invoice tie-break):
 //
-// Matching strategy, in order:
-//   1. BillRefNumber looks like an explicit invoice reference
-//      (e.g. "INV-<firestoreDocId>", matching the AccountReference
-//      the app sends on STK Push) -> direct doc lookup, or exact
-//      match against the invoice's invoiceNumber field.
-//   2. Exact balance-due match against open (unpaid/partiallyPaid)
-//      invoices - mirrors the amount-first matching strategy the
-//      Flutter app already uses for Equity SMS reconciliation
-//      (see sms_payment_service.dart _matchInvoice).
-//   3. If more than one invoice has that exact balance due, narrow
-//      by comparing the payer's MSISDN against the invoice's
-//      customerPhone.
-//   4. Otherwise: no confident match. The raw payment is still
-//      saved (c2b_transactions) and a flagged, unreconciled
-//      payment_reconciliations entry is created so it shows up in
-//      the app's existing Reconciliation screen for manual review
-//      - it is never silently dropped, and no invoice is guessed.
+//   Rule 1: exact balance-due match against open (unpaid/
+//      partiallyPaid) invoices -> disambiguate by name similarity.
+//   Rule 2: no exact amount match (or amount match didn't clear the
+//      name threshold) -> strict name-only match across ALL open
+//      invoices.
+//   Rule 3: nothing qualifies -> no match.
 //
-function normalizePhoneForMatch(phone) {
-  if (!phone) return "";
-  const digits = String(phone).replace(/\D/g, "");
-  return digits.length >= 9 ? digits.slice(-9) : digits;
+// Unlike the SMS flow, an unmatched C2B payment does NOT auto-create
+// an invoice - it is saved in full to the `unmatched_payments`
+// collection (the same shape as UnmatchedPayment.toFirestore() in
+// lib/models/unmatched_payment.dart) for manual review, and no
+// invoice is guessed.
+//
+const NAME_MATCH_MIN_SCORE = 75;
+
+function normalizeNameForMatch(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, "")
+    .replace(/\s+/g, " ");
 }
 
-async function findInvoiceForC2B({ billRefNumber, amount, msisdn }) {
-  const ref = (billRefNumber || "").trim();
+function levenshtein(s, t) {
+  if (s === t) return 0;
+  if (s.length === 0) return t.length;
+  if (t.length === 0) return s.length;
 
-  if (ref) {
-    if (/^INV-/i.test(ref)) {
-      const candidateId = ref.replace(/^INV-/i, "").trim();
+  let prev = Array.from({ length: t.length + 1 }, (_, i) => i);
+  let curr = new Array(t.length + 1).fill(0);
 
-      if (candidateId) {
-        const doc = await db.collection("invoices").doc(candidateId).get();
+  for (let i = 1; i <= s.length; i++) {
+    curr[0] = i;
 
-        if (doc.exists) {
-          return { invoice: doc, strategy: "billRefNumber_docId" };
-        }
-      }
+    for (let j = 1; j <= t.length; j++) {
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
     }
 
-    const byNumber = await db
-      .collection("invoices")
-      .where("invoiceNumber", "==", ref)
-      .limit(2)
-      .get();
+    [prev, curr] = [curr, prev];
+  }
 
-    if (byNumber.size === 1) {
-      return { invoice: byNumber.docs[0], strategy: "billRefNumber_invoiceNumber" };
+  return prev[t.length];
+}
+
+function tokenSimilarity(a, b) {
+  if (a === b) return 100;
+
+  if (a.includes(b) || b.includes(a)) {
+    const shorterLen = Math.min(a.length, b.length);
+    const longerLen = Math.max(a.length, b.length);
+    return Math.round(55 + (shorterLen / longerLen) * 45);
+  }
+
+  const dist = levenshtein(a, b);
+  const maxLen = Math.max(a.length, b.length);
+
+  if (maxLen === 0) return 0;
+
+  const similarity = (1 - dist / maxLen) * 100;
+  return Math.round(Math.max(similarity, 0));
+}
+
+function nameSimilarity(a, b) {
+  const tokensA = normalizeNameForMatch(a)
+    .split(" ")
+    .filter((t) => t.length >= 2);
+  const tokensB = normalizeNameForMatch(b)
+    .split(" ")
+    .filter((t) => t.length >= 2);
+
+  if (tokensA.length === 0 || tokensB.length === 0) return 0;
+
+  const [shorter, longer] =
+    tokensA.length <= tokensB.length ? [tokensA, tokensB] : [tokensB, tokensA];
+
+  let total = 0;
+
+  for (const tok of shorter) {
+    let best = 0;
+
+    for (const other of longer) {
+      const score = tokenSimilarity(tok, other);
+      if (score > best) best = score;
+    }
+
+    total += best;
+  }
+
+  return Math.round(total / shorter.length);
+}
+
+function pickBestNameMatch(paymentName, candidates, minScore) {
+  if (!paymentName) return null;
+
+  let bestScore = -1;
+  let best = [];
+
+  for (const c of candidates) {
+    const score = nameSimilarity(paymentName, c.customerName || "");
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = [c];
+    } else if (score === bestScore) {
+      best.push(c);
     }
   }
 
+  if (best.length === 0 || bestScore < minScore) return null;
+  if (best.length === 1) return best[0];
+
+  best.sort((a, b) => b.dateMillis - a.dateMillis);
+  return best[0];
+}
+
+function matchInvoiceForPayment({ paymentName, paymentAmount, candidates }) {
+  if (candidates.length === 0) return null;
+
+  const exactAmountMatches = candidates.filter(
+    (c) => Math.abs(c.balanceDue - paymentAmount) < 0.01
+  );
+
+  if (exactAmountMatches.length > 0) {
+    const best = pickBestNameMatch(paymentName, exactAmountMatches, NAME_MATCH_MIN_SCORE);
+    if (best) return best;
+  }
+
+  return pickBestNameMatch(paymentName, candidates, NAME_MATCH_MIN_SCORE);
+}
+
+async function findInvoiceForC2B({ amount, customerName }) {
   const openInvoices = await db
     .collection("invoices")
     .where("paymentStatus", "in", ["unpaid", "partiallyPaid"])
     .get();
 
-  const amountCandidates = openInvoices.docs.filter((doc) => {
+  const candidates = openInvoices.docs.map((doc) => {
     const data = doc.data();
-    const balanceDue = (data.total || 0) - (data.amountPaid || 0);
-    return Math.abs(balanceDue - amount) < 0.5;
+    return {
+      id: doc.id,
+      doc,
+      customerName: data.customerName || "",
+      balanceDue:
+        data.balanceDue != null
+          ? data.balanceDue
+          : (data.total || 0) - (data.amountPaid || 0),
+      dateMillis: data.date ? data.date.toMillis() : 0,
+    };
   });
 
-  if (amountCandidates.length === 1) {
-    return { invoice: amountCandidates[0], strategy: "amount" };
+  const matched = matchInvoiceForPayment({
+    paymentName: customerName,
+    paymentAmount: amount,
+    candidates,
+  });
+
+  if (matched) {
+    return { invoice: matched.doc, strategy: "sms_style_amount_and_name_match" };
   }
 
-  if (amountCandidates.length > 1 && msisdn) {
-    const normalizedMsisdn = normalizePhoneForMatch(msisdn);
-
-    const phoneNarrowed = amountCandidates.filter((doc) => {
-      const phone = doc.data().customerPhone;
-      return phone && normalizePhoneForMatch(phone) === normalizedMsisdn;
-    });
-
-    if (phoneNarrowed.length === 1) {
-      return { invoice: phoneNarrowed[0], strategy: "amount_and_phone" };
-    }
-  }
-
-  return {
-    invoice: null,
-    strategy: amountCandidates.length > 1 ? "ambiguous" : "no_match",
-  };
+  return { invoice: null, strategy: "no_match" };
 }
 
 
@@ -1299,9 +1403,8 @@ app.post(
 
         try {
           const { invoice, strategy } = await findInvoiceForC2B({
-            billRefNumber: BillRefNumber,
             amount,
-            msisdn: MSISDN,
+            customerName,
           });
 
           if (invoice) {
@@ -1334,33 +1437,32 @@ app.post(
           } else {
             await c2bRef.update({ matched: false, matchStrategy: strategy });
 
-            // Never silently drop an unmatched payment: flag it in the
-            // same payment_reconciliations collection the app's existing
-            // Reconciliation screen already displays, so staff can find
-            // and manually link it to the right invoice.
-            await db.collection("payment_reconciliations").add({
-              invoiceId: "",
-              invoiceNumber: "UNMATCHED",
-              customerName: customerName || "Unknown",
-              paymentMethod: "mpesa",
+            // No confident invoice match (same amount+name logic as the
+            // SMS flow) - unlike the SMS flow, this does NOT auto-create
+            // an invoice. The full payment is saved to unmatched_payments
+            // (same shape as UnmatchedPayment.toFirestore() in
+            // lib/models/unmatched_payment.dart) for manual review.
+            await db.collection("unmatched_payments").add({
+              rawSms: `C2B Till payment - TransID: ${TransID}, BusinessShortCode: ${
+                BusinessShortCode || process.env.SHORTCODE || ""
+              }, BillRef: ${BillRefNumber || "none"}`,
+              customerName: customerName || null,
+              customerPhone: MSISDN || null,
               amount,
-              referenceCode: TransID,
-              message: `Unmatched Till/C2B payment (${strategy}). BillRef: ${
-                BillRefNumber || "N/A"
-              }, Phone: ${MSISDN || "N/A"}.`,
-              depositDate: admin.firestore.FieldValue.serverTimestamp(),
-              reconciled: false,
-              flagged: true,
-              reviewNote:
-                "Auto-received C2B/Till payment could not be matched to an invoice automatically. Please match manually.",
-              recordedByUid: "system",
-              recordedByName: "M-Pesa C2B",
-              source: "c2b",
-              transId: TransID,
+              reference: TransID,
+              transactionDate: admin.firestore.Timestamp.fromDate(
+                parseMpesaTimestamp(TransTime) || new Date()
+              ),
+              reason: `No matching open invoice found (${strategy})`,
+              resolved: false,
+              resolvedAt: null,
+              resolvedByUid: null,
+              resolvedByName: null,
+              matchedInvoiceId: null,
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
             });
 
-            firestoreResult = `unmatched (${strategy}) - flagged in payment_reconciliations for manual review`;
+            firestoreResult = `unmatched (${strategy}) - saved to unmatched_payments for manual review`;
           }
         } catch (err) {
           console.error("❌ C2B async matching/recording error:", err);
@@ -1609,9 +1711,8 @@ app.get("/api/mpesa/pull/query", async (req, res) => {
 
       try {
         const { invoice, strategy } = await findInvoiceForC2B({
-          billRefNumber: t.billreference,
           amount,
-          msisdn: t.msisdn,
+          customerName: t.sender || "",
         });
 
         if (invoice) {
@@ -1638,26 +1739,26 @@ app.get("/api/mpesa/pull/query", async (req, res) => {
           await c2bRef.update({ matched: false, matchStrategy: strategy });
 
           // Same pattern as the live C2B confirmation handler: never
-          // silently drop a recovered payment that couldn't be matched.
-          await db.collection("payment_reconciliations").add({
-            invoiceId: "",
-            invoiceNumber: "UNMATCHED",
-            customerName: t.sender || "Unknown",
-            paymentMethod: "mpesa",
+          // silently drop a recovered payment that couldn't be matched,
+          // and never auto-create an invoice for it either - save the
+          // full payment to unmatched_payments for manual review.
+          await db.collection("unmatched_payments").add({
+            rawSms: `Pull-recovered C2B payment - TransID: ${transactionId}, BusinessShortCode: ${shortCode}, BillRef: ${
+              t.billreference || "none"
+            }`,
+            customerName: t.sender || null,
+            customerPhone: t.msisdn ? String(t.msisdn) : null,
             amount,
-            referenceCode: transactionId,
-            message: `Unmatched Pull-recovered C2B payment (${strategy}). BillRef: ${
-              t.billreference || "N/A"
-            }, Phone: ${t.msisdn || "N/A"}.`,
-            depositDate: admin.firestore.FieldValue.serverTimestamp(),
-            reconciled: false,
-            flagged: true,
-            reviewNote:
-              "Recovered via Pull Transactions API - could not be matched to an invoice automatically. Please match manually.",
-            recordedByUid: "system",
-            recordedByName: "M-Pesa Pull API",
-            source: "pull",
-            transId: transactionId,
+            reference: transactionId,
+            transactionDate: admin.firestore.Timestamp.fromDate(
+              parseMpesaTimestamp(t.trxDate) || new Date()
+            ),
+            reason: `No matching open invoice found (${strategy})`,
+            resolved: false,
+            resolvedAt: null,
+            resolvedByUid: null,
+            resolvedByName: null,
+            matchedInvoiceId: null,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
           });
         }
