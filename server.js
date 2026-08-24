@@ -1412,13 +1412,7 @@ app.post("/api/mpesa/account-balance", async (req, res) => {
 
     const initiatorName = process.env.INITIATOR_NAME;
 
-    // Defaults to SHORTCODE (not PARTY_B/the Till) - the C2B
-    // registration attempt earlier showed this API app is only
-    // authorized for its own shortcode (4363819), not the Till number
-    // directly ("Kindly use your own ShortCode"). Overridable via
-    // ACCOUNT_BALANCE_SHORTCODE if that's ever not the case.
-    const partyA =
-      process.env.ACCOUNT_BALANCE_SHORTCODE || process.env.SHORTCODE;
+    const partyA = process.env.ACCOUNT_BALANCE_SHORTCODE;
 
     const resultURL = process.env.ACCOUNT_BALANCE_RESULT_URL;
     const timeoutURL = process.env.ACCOUNT_BALANCE_TIMEOUT_URL;
@@ -1433,7 +1427,7 @@ app.post("/api/mpesa/account-balance", async (req, res) => {
     if (!partyA) {
       return res.status(500).json({
         success: false,
-        error: "SHORTCODE/ACCOUNT_BALANCE_SHORTCODE is not configured",
+        error: "ACCOUNT_BALANCE_SHORTCODE is not configured",
       });
     }
 
