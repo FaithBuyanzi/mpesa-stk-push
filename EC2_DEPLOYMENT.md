@@ -33,9 +33,9 @@ AWS Console → EC2 → **Launch instance**
 |---|---|
 | Name | `selete-agro-backend` |
 | AMI | **Ubuntu Server 24.04 LTS**. Match the architecture to the instance: **Arm64** for any `t4g.*`, **64-bit x86** for `t3.*`. Picking the wrong one is the most common first-attempt mistake. |
-| Instance type | `t4g.small` is the comfortable choice. **`t4g.nano` (512 MB) does work** — the app idles at ~67 MB RSS and the dependency tree is pure JS with no native modules to compile on ARM — but you must follow the [512 MB notes](#running-on-a-512-mb-instance-t4gnano) below or it will fail during `npm ci`. |
+| Instance type | **`t4g.micro`** (2 vCPU, 1 GB) — what this guide is tuned for. The app idles at ~67 MB RSS and the dependency tree is pure JS with no native modules to compile on ARM, so 1 GB is comfortable. `t4g.nano` (512 MB) also works but needs tighter limits — see [sizing](#sizing-and-memory-tuning). |
 | Key pair | Create a new one, download the `.pem`, keep it safe — you cannot re-download it |
-| Storage | 8 GB gp3 is plenty (`node_modules` is 77 MB; a base Ubuntu install is ~2.6 GB). 20 GB if you want room for logs and future growth. |
+| Storage | 12 GB gp3. `node_modules` is 77 MB and a base Ubuntu install is ~2.6 GB, so this leaves ample room for the swap file and logs. |
 
 **Network settings → Edit**, create a security group with these inbound rules:
 
@@ -46,7 +46,7 @@ AWS Console → EC2 → **Launch instance**
 | HTTPS | 443 | 0.0.0.0/0 | Safaricom callbacks + your Flutter app |
 
 > Safaricom's callback servers come from a range they don't publish reliably, so
-> 443 must stay open to the world. Leave port 3000 **closed** — Nginx proxies to
+> 443 must stay open to the world. Leave port 3000 **closed** — Caddy proxies to
 > it over localhost.
 
 Launch it.
@@ -76,7 +76,8 @@ Value: <ELASTIC_IP>
 TTL:   300
 ```
 
-Verify it resolves before continuing — Certbot will fail otherwise:
+Verify it resolves before continuing — Caddy's certificate request will fail
+otherwise:
 
 ```bash
 dig +short api.yourdomain.com
@@ -104,9 +105,11 @@ On Windows, the same command works in PowerShell (OpenSSH ships with Windows
 
 ### 5a. Swap — do this FIRST on anything under 2 GB
 
-Before installing anything. `npm ci` peaks well above 512 MB and will be
-OOM-killed halfway through, leaving a corrupt `node_modules` that produces
-confusing downstream errors.
+Before installing anything. `npm ci` is the most memory-hungry thing that will
+ever run on this box: on 512 MB it gets OOM-killed outright, and on 1 GB it can
+still spike close enough to the ceiling to be worth insuring against. An
+interrupted install leaves a corrupt `node_modules` that fails later with errors
+looking nothing like "out of memory".
 
 ```bash
 sudo fallocate -l 2G /swapfile
@@ -133,7 +136,7 @@ sudo apt update && sudo apt upgrade -y
 
 # Node.js 20 LTS (package.json requires >=18). NodeSource ships arm64.
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt install -y nodejs git nginx
+sudo apt install -y nodejs git
 
 node -v    # expect v20.x
 npm -v
@@ -144,7 +147,7 @@ Enable the host firewall as a second layer behind the security group:
 
 ```bash
 sudo ufw allow OpenSSH
-sudo ufw allow 'Nginx Full'
+sudo ufw allow 80,443/tcp
 sudo ufw --force enable
 ```
 
@@ -227,7 +230,7 @@ chmod 600 /var/www/selete-agro-backend/.env
 > and paste the output. The `\n` escapes inside `private_key` must survive
 > verbatim — don't let an editor reformat them.
 
-Smoke-test before wiring up Nginx:
+Smoke-test before wiring up the proxy:
 
 ```bash
 cd /var/www/selete-agro-backend
@@ -242,9 +245,9 @@ You should see the Firebase init lines and `Server running on port 3000`.
 ## Step 8 — Run it under systemd (restarts + survives reboots)
 
 Use **systemd, not PM2**. PM2 runs a supervisor daemon that costs 30–50 MB of
-resident memory to do a job systemd already does natively — on a 512 MB box
-that's ~10% of your RAM spent on a process babysitter. systemd gives you
-auto-restart, boot persistence, log management and memory caps for free.
+resident memory to do a job systemd already does natively. systemd gives you
+auto-restart, boot persistence, log management and memory caps for free, with no
+extra process to supervise the supervisor.
 
 ```bash
 sudo nano /etc/systemd/system/selete-agro.service
@@ -268,15 +271,18 @@ User=ubuntu
 WorkingDirectory=/var/www/selete-agro-backend
 
 # Cap V8's heap. Without this Node sizes old-space from total system memory
-# and will happily grow into swap before garbage collecting.
-ExecStart=/usr/bin/node --max-old-space-size=192 server.js
+# and will happily grow into swap before garbage collecting. 384 MB is ~20x the
+# app's measured 17 MB heap - generous headroom, while still leaving room for
+# the OS page cache on a 1 GB box. Use 192 on a 512 MB instance.
+ExecStart=/usr/bin/node --max-old-space-size=384 server.js
 
 Restart=always
 RestartSec=5
 
 # Hard ceiling. If the app ever leaks, systemd kills and restarts it instead
-# of letting the OOM killer pick a victim (which might be nginx or sshd).
-MemoryMax=300M
+# of letting the OOM killer pick a victim (which might be caddy or sshd).
+# Sits above the heap cap to allow for non-heap RSS. Use 300M on 512 MB.
+MemoryMax=512M
 
 StandardOutput=journal
 StandardError=journal
@@ -311,70 +317,83 @@ sudo systemctl restart systemd-journald
 
 ---
 
-## Step 9 — Nginx reverse proxy
+## Step 9 — Caddy reverse proxy (with automatic HTTPS)
+
+Caddy provisions and renews the Let's Encrypt certificate itself, so it replaces
+both the reverse proxy **and** certbot. No snapd, no renewal timer to verify, no
+separate TLS step. It costs ~10 MB more resident memory than nginx — irrelevant
+on 1 GB, and worth it for having one moving part instead of three.
+
+Install from Caddy's official apt repo (arm64 is supported):
 
 ```bash
-sudo nano /etc/nginx/sites-available/selete-agro
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+
+sudo apt update && sudo apt install -y caddy
 ```
 
-```nginx
-server {
-    listen 80;
-    server_name api.yourdomain.com;
+Write the config:
 
-    location / {
-        proxy_pass         http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header   Host              $host;
-        proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
+```bash
+sudo nano /etc/caddy/Caddyfile
+```
 
+Replace the entire file with this — yes, this is the whole thing:
+
+```caddyfile
+{
+    # Let's Encrypt sends expiry warnings here. Use a real address.
+    email you@yourdomain.com
+}
+
+api.yourdomain.com {
+    reverse_proxy 127.0.0.1:3000 {
         # Safaricom retries slow callbacks - give the app room to respond
-        proxy_read_timeout 60s;
+        transport http {
+            read_timeout 60s
+        }
+    }
+
+    encode gzip
+
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10MB
+            roll_keep 5
+        }
     }
 }
 ```
 
-Enable it and drop the default site:
+Caddy sets `X-Forwarded-For`, `X-Forwarded-Proto` and `Host` on proxied requests
+by default, and redirects HTTP → HTTPS automatically. There is nothing to add
+for either.
+
+Validate and load:
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/selete-agro /etc/nginx/sites-enabled/
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo nginx -t && sudo systemctl reload nginx
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+sudo systemctl status caddy
 ```
 
-Test over plain HTTP:
+On first load Caddy contacts Let's Encrypt and provisions the certificate. That
+needs **port 80 reachable from the internet** and the A record from Step 3
+already resolving. Watch it happen:
 
 ```bash
-curl http://api.yourdomain.com/health
+journalctl -u caddy -f
 ```
 
----
-
-## Step 10 — HTTPS with Let's Encrypt
-
-Safaricom **will not deliver callbacks to a non-HTTPS or self-signed endpoint.**
-
-Install it from **apt, not snap**. The snap version drags in `snapd`, which is a
-permanent ~80 MB resident daemon — unaffordable on 512 MB, and pointless when
-apt ships the same thing.
-
-```bash
-sudo apt install -y certbot python3-certbot-nginx
-
-sudo certbot --nginx -d api.yourdomain.com
-```
-
-Choose **redirect HTTP → HTTPS** when prompted. Certbot rewrites the Nginx
-config for you.
-
-Confirm auto-renewal is armed (certs last 90 days):
-
-```bash
-sudo systemctl status certbot.timer
-sudo certbot renew --dry-run
-```
+Look for `certificate obtained successfully`. If it fails, the message names the
+reason — almost always DNS not yet propagated or port 80 blocked in the security
+group.
 
 Verify from **outside** the server — your own laptop, not the instance:
 
@@ -383,6 +402,25 @@ curl https://api.yourdomain.com/health
 ```
 
 It must return `{"status":"OK","timestamp":"..."}` with no certificate warning.
+
+---
+
+## Step 10 — Confirm renewal is handled
+
+Nothing to configure — Caddy renews automatically, in-process, roughly 30 days
+before expiry. This step is just knowing how to check it.
+
+```bash
+# Certificates and their expiry, as Caddy sees them
+sudo ls -la /var/lib/caddy/.local/share/caddy/certificates/
+
+# Renewal activity appears in the service log
+journalctl -u caddy | grep -i 'certificate\|renew'
+```
+
+The one failure mode to know about: renewal needs port 80 to stay open. If you
+ever tighten the security group to 443-only, renewals will start failing
+silently ~60 days later. Leave 80 open.
 
 ---
 
@@ -487,17 +525,17 @@ sudo systemctl status selete-agro       # is it running?
 journalctl -u selete-agro -f            # live logs
 sudo systemctl restart selete-agro      # restart
 systemd-cgtop                           # per-service CPU / memory
-sudo systemctl reload nginx             # after editing nginx config
-sudo tail -f /var/log/nginx/error.log   # proxy-level errors
+sudo systemctl reload caddy             # after editing /etc/caddy/Caddyfile
+journalctl -u caddy -f                  # proxy + TLS renewal logs
 df -h                                   # disk
 free -h                                 # memory + swap
 vmstat 1                                # si/so columns = active swapping
 ```
 
 
-### Running on a 512 MB instance (t4g.nano)
+### Sizing and memory tuning
 
-It fits, but there is no slack. Measured footprint of this app:
+Measured footprint of this app:
 
 | | |
 |---|---|
@@ -506,20 +544,33 @@ It fits, but there is no slack. Measured footprint of this app:
 | Under Firestore/gRPC load | ~100–150 MB expected |
 | `node_modules` on disk | 77 MB |
 
-Rough budget on 512 MB: Ubuntu ~150 MB + nginx ~15 MB + app ~150 MB peak
-≈ **315 MB**, leaving ~200 MB of headroom. Workable. What eats that headroom:
+Budget on **t4g.micro (1 GB)**: Ubuntu ~150 MB + caddy ~25 MB + app ~150 MB peak
+≈ **315 MB**, leaving roughly 700 MB free for the OS page cache and headroom.
+That is a comfortable margin, not a tight one — this is the recommended size.
+
+Tuning values by instance:
+
+| | `t4g.nano` (512 MB) | `t4g.micro` (1 GB) |
+|---|---|---|
+| `--max-old-space-size` | 192 | **384** |
+| `MemoryMax` | 300M | **512M** |
+| Swap | Mandatory | Recommended |
+| Remove snapd | Yes | Worthwhile (~80 MB) |
+
+What eats headroom on either size:
 
 - **PM2** (30–50 MB) — use systemd instead, per Step 8.
-- **snapd** (~80 MB) — install certbot from apt, per Step 10. If snapd is
-  already present and you use no snaps, reclaim it:
+- **snapd** (~80 MB) — nothing in this guide needs it (Caddy comes from apt and
+  handles TLS itself). If snapd is present and you use no snaps, reclaim it:
   ```bash
   sudo systemctl disable --now snapd.service snapd.socket snapd.seeded.service
   # or remove entirely: sudo apt purge -y snapd
   ```
-- **`npm ci` without swap** — peaks past 512 MB and gets OOM-killed. Step 5a.
+- **`npm ci` without swap** — the peak memory event on the box. Step 5a.
 - **Unbounded V8 heap** — Node sizes old-space from *total system* memory and
-  will grow into swap before collecting. `--max-old-space-size=192` in the unit
-  file caps it.
+  will grow into swap before collecting. The `--max-old-space-size` above caps
+  it. Note this is a *ceiling*, not a reservation: the app still runs at its
+  measured ~17 MB heap and only grows if something genuinely needs the space.
 
 Check what's actually resident:
 
@@ -529,12 +580,9 @@ systemctl status selete-agro | grep Memory
 free -h
 ```
 
-**Should you upsize?** `t4g.nano` is ~$3/month, `t4g.micro` (1 GB) ~$6. This is
-a payment server where an OOM kill during a callback means a real payment lands
-in `unmatched_payments` — or is lost until someone runs the Pull recovery. The
-$3/month difference buys a 2× memory margin. Nano is a defensible choice with
-the hardening above; micro is the one I'd pick. CPU is not the concern either
-way — 2 vCPU burstable is far more than these callback volumes need.
+CPU is not a concern at either size — 2 burstable vCPUs are far more than these
+callback volumes need. If you ever do outgrow 1 GB, the symptom to watch for is
+sustained swap activity in `vmstat 1`, not CPU.
 
 ### Recovering payments missed during downtime
 
@@ -557,18 +605,21 @@ Already-known transactions are skipped by TransID, so this is safe to re-run.
 | Symptom | Cause / fix |
 |---|---|
 | `curl` from outside times out | Security group missing 80/443, or `ufw` blocking. Check both. |
-| Certbot fails DNS validation | A record not propagated, or port 80 closed. Run `dig +short api.yourdomain.com` first. |
+| Caddy cannot obtain a certificate | A record not propagated, or port 80 closed. Run `dig +short api.yourdomain.com`, then `journalctl -u caddy | grep -i certificate` for the actual reason. |
 | App exits on boot with a Firebase error | `FIREBASE_SERVICE_ACCOUNT` is malformed — usually the `\n` inside `private_key` got mangled. Regenerate it. |
 | STK push returns ResponseCode 0 but no prompt; query says `4999` | Wrong credentials. `mpesa.js` already forces EAT (UTC+3) for the password timestamp, so this is a `SHORTCODE`/`PASSKEY` mismatch — the passkey must belong to that till. |
 | Callbacks never arrive | Safaricom is still pointed at the old Render URL. Redo Step 11. |
-| `502 Bad Gateway` from Nginx | The Node process is down: `sudo systemctl status selete-agro`, `journalctl -u selete-agro -n 50`. |
+| `502 Bad Gateway` from Caddy | The Node process is down: `sudo systemctl status selete-agro`, `journalctl -u selete-agro -n 50`. |
 | Instance IP changed after a reboot | You skipped the Elastic IP (Step 2). |
 
 ---
 
 ## Cost note
 
-`t3.small` on-demand runs roughly **$15–17/month** plus about $2 for the 20 GB
-volume. `t3.micro` is roughly half that. An Elastic IP is free **while attached
-to a running instance** — you get billed for it while the instance is stopped,
-so release it if you ever tear the instance down.
+`t4g.micro` on-demand runs roughly **$6/month** plus about $1 for the 12 GB
+volume. Graviton (`t4g.*`) is cheaper than the equivalent `t3.*` for the same
+memory, which is a second reason to stay on ARM here.
+
+An Elastic IP is free **while attached to a running instance** — you get billed
+for it while the instance is stopped, so release it if you ever tear the
+instance down.
