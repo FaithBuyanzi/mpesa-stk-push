@@ -32,10 +32,10 @@ AWS Console → EC2 → **Launch instance**
 | Setting | Value |
 |---|---|
 | Name | `selete-agro-backend` |
-| AMI | **Ubuntu Server 24.04 LTS (64-bit x86)** |
-| Instance type | **t3.small** recommended. `t3.micro` (1 GB RAM) works but `firebase-admin` is memory-hungry — if you use it, add the swap file in Step 5. |
+| AMI | **Ubuntu Server 24.04 LTS**. Match the architecture to the instance: **Arm64** for any `t4g.*`, **64-bit x86** for `t3.*`. Picking the wrong one is the most common first-attempt mistake. |
+| Instance type | `t4g.small` is the comfortable choice. **`t4g.nano` (512 MB) does work** — the app idles at ~67 MB RSS and the dependency tree is pure JS with no native modules to compile on ARM — but you must follow the [512 MB notes](#running-on-a-512-mb-instance-t4gnano) below or it will fail during `npm ci`. |
 | Key pair | Create a new one, download the `.pem`, keep it safe — you cannot re-download it |
-| Storage | 20 GB gp3 |
+| Storage | 8 GB gp3 is plenty (`node_modules` is 77 MB; a base Ubuntu install is ~2.6 GB). 20 GB if you want room for logs and future growth. |
 
 **Network settings → Edit**, create a security group with these inbound rules:
 
@@ -102,20 +102,11 @@ On Windows, the same command works in PowerShell (OpenSSH ships with Windows
 
 ## Step 5 — Prepare the server
 
-```bash
-# System packages
-sudo apt update && sudo apt upgrade -y
+### 5a. Swap — do this FIRST on anything under 2 GB
 
-# Node.js 20 LTS (package.json requires >=18)
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt install -y nodejs git nginx
-
-node -v    # expect v20.x
-npm -v
-```
-
-**Only if you chose `t3.micro`** — add 2 GB of swap so `npm ci` and
-`firebase-admin` don't get OOM-killed:
+Before installing anything. `npm ci` peaks well above 512 MB and will be
+OOM-killed halfway through, leaving a corrupt `node_modules` that produces
+confusing downstream errors.
 
 ```bash
 sudo fallocate -l 2G /swapfile
@@ -123,6 +114,30 @@ sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# Only swap under real pressure - EBS-backed swap is slow
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+
+free -h    # confirm 2.0Gi swap
+```
+
+Swap here is an **OOM safety net, not extra RAM**. If the app is actively
+swapping in steady state, the instance is too small — check with `vmstat 1`
+(the `si`/`so` columns should sit at 0).
+
+### 5b. Packages
+
+```bash
+sudo apt update && sudo apt upgrade -y
+
+# Node.js 20 LTS (package.json requires >=18). NodeSource ships arm64.
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs git nginx
+
+node -v    # expect v20.x
+npm -v
+uname -m   # aarch64 on t4g, x86_64 on t3
 ```
 
 Enable the host firewall as a second layer behind the security group:
@@ -224,34 +239,74 @@ You should see the Firebase init lines and `Server running on port 3000`.
 
 ---
 
-## Step 8 — Run it under PM2 (restarts + survives reboots)
+## Step 8 — Run it under systemd (restarts + survives reboots)
+
+Use **systemd, not PM2**. PM2 runs a supervisor daemon that costs 30–50 MB of
+resident memory to do a job systemd already does natively — on a 512 MB box
+that's ~10% of your RAM spent on a process babysitter. systemd gives you
+auto-restart, boot persistence, log management and memory caps for free.
 
 ```bash
-sudo npm install -g pm2
-
-cd /var/www/selete-agro-backend
-pm2 start server.js --name selete-agro-backend
-
-# Make it come back after a reboot
-pm2 startup systemd
-#   ^ this PRINTS a `sudo env PATH=... pm2 startup ...` command — run that command
-pm2 save
+sudo nano /etc/systemd/system/selete-agro.service
 ```
 
-Verify:
+```ini
+[Unit]
+Description=Selete Agro M-Pesa backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+
+# server.js calls dotenv.config(), which reads .env from the working directory.
+# Deliberately NOT using systemd's EnvironmentFile= here: systemd applies its
+# own C-style escape processing, which mangles the \n sequences inside the
+# FIREBASE_SERVICE_ACCOUNT private key and produces an unusable credential.
+# Letting dotenv parse the file keeps it byte-for-byte.
+WorkingDirectory=/var/www/selete-agro-backend
+
+# Cap V8's heap. Without this Node sizes old-space from total system memory
+# and will happily grow into swap before garbage collecting.
+ExecStart=/usr/bin/node --max-old-space-size=192 server.js
+
+Restart=always
+RestartSec=5
+
+# Hard ceiling. If the app ever leaks, systemd kills and restarts it instead
+# of letting the OOM killer pick a victim (which might be nginx or sshd).
+MemoryMax=300M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=selete-agro
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> The app loads `.env` itself via `dotenv`, relative to `WorkingDirectory`. So
+> the `.env` from Step 7 works unchanged — including the single-line
+> `FIREBASE_SERVICE_ACCOUNT` JSON with its `\n` escapes intact.
+
+Enable and start:
 
 ```bash
-pm2 status
-pm2 logs selete-agro-backend --lines 50
+sudo systemctl daemon-reload
+sudo systemctl enable --now selete-agro
+
+sudo systemctl status selete-agro
 curl http://localhost:3000/health
 ```
 
-Stop logs from filling the disk:
+Cap the journal so logs can't fill the disk:
 
 ```bash
-pm2 install pm2-logrotate
-pm2 set pm2-logrotate:max_size 10M
-pm2 set pm2-logrotate:retain 14
+sudo mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=200M\nMaxRetentionSec=14day\n' \
+  | sudo tee /etc/systemd/journald.conf.d/size.conf
+sudo systemctl restart systemd-journald
 ```
 
 ---
@@ -301,9 +356,12 @@ curl http://api.yourdomain.com/health
 
 Safaricom **will not deliver callbacks to a non-HTTPS or self-signed endpoint.**
 
+Install it from **apt, not snap**. The snap version drags in `snapd`, which is a
+permanent ~80 MB resident daemon — unaffordable on 512 MB, and pointless when
+apt ships the same thing.
+
 ```bash
-sudo snap install --classic certbot
-sudo ln -s /snap/bin/certbot /usr/bin/certbot
+sudo apt install -y certbot python3-certbot-nginx
 
 sudo certbot --nginx -d api.yourdomain.com
 ```
@@ -314,7 +372,7 @@ config for you.
 Confirm auto-renewal is armed (certs last 90 days):
 
 ```bash
-sudo systemctl status snap.certbot.renew.timer
+sudo systemctl status certbot.timer
 sudo certbot renew --dry-run
 ```
 
@@ -371,7 +429,7 @@ curl -X POST https://api.yourdomain.com/api/mpesa/pay \
 Watch the callback land:
 
 ```bash
-pm2 logs selete-agro-backend
+journalctl -u selete-agro -f
 ```
 
 You want `========== STK CALLBACK ==========` followed by
@@ -412,26 +470,71 @@ Once real payments are confirmed landing on EC2:
 cd /var/www/selete-agro-backend
 git pull
 npm ci --omit=dev
-pm2 restart selete-agro-backend
-pm2 logs selete-agro-backend --lines 30
+sudo systemctl restart selete-agro
+journalctl -u selete-agro -n 30 --no-pager
 ```
 
-`.env` is gitignored, so it survives a `git pull` untouched.
+`.env` is gitignored, so it survives a `git pull` untouched. Note that
+`systemctl restart` — not `reload` — is required after changing `.env`, since
+dotenv reads it once at process start.
 
 ---
 
 ## Operations cheat-sheet
 
 ```bash
-pm2 status                              # is it running?
-pm2 logs selete-agro-backend            # live logs
-pm2 restart selete-agro-backend         # restart
-pm2 monit                               # CPU / memory
+sudo systemctl status selete-agro       # is it running?
+journalctl -u selete-agro -f            # live logs
+sudo systemctl restart selete-agro      # restart
+systemd-cgtop                           # per-service CPU / memory
 sudo systemctl reload nginx             # after editing nginx config
 sudo tail -f /var/log/nginx/error.log   # proxy-level errors
-df -h                                   # disk (logs fill it up)
-free -m                                 # memory
+df -h                                   # disk
+free -h                                 # memory + swap
+vmstat 1                                # si/so columns = active swapping
 ```
+
+
+### Running on a 512 MB instance (t4g.nano)
+
+It fits, but there is no slack. Measured footprint of this app:
+
+| | |
+|---|---|
+| Node baseline | 46 MB RSS |
+| App loaded and listening | **67 MB RSS** (17 MB heap used) |
+| Under Firestore/gRPC load | ~100–150 MB expected |
+| `node_modules` on disk | 77 MB |
+
+Rough budget on 512 MB: Ubuntu ~150 MB + nginx ~15 MB + app ~150 MB peak
+≈ **315 MB**, leaving ~200 MB of headroom. Workable. What eats that headroom:
+
+- **PM2** (30–50 MB) — use systemd instead, per Step 8.
+- **snapd** (~80 MB) — install certbot from apt, per Step 10. If snapd is
+  already present and you use no snaps, reclaim it:
+  ```bash
+  sudo systemctl disable --now snapd.service snapd.socket snapd.seeded.service
+  # or remove entirely: sudo apt purge -y snapd
+  ```
+- **`npm ci` without swap** — peaks past 512 MB and gets OOM-killed. Step 5a.
+- **Unbounded V8 heap** — Node sizes old-space from *total system* memory and
+  will grow into swap before collecting. `--max-old-space-size=192` in the unit
+  file caps it.
+
+Check what's actually resident:
+
+```bash
+ps -eo rss,comm --sort=-rss | head -12   # top consumers, KB
+systemctl status selete-agro | grep Memory
+free -h
+```
+
+**Should you upsize?** `t4g.nano` is ~$3/month, `t4g.micro` (1 GB) ~$6. This is
+a payment server where an OOM kill during a callback means a real payment lands
+in `unmatched_payments` — or is lost until someone runs the Pull recovery. The
+$3/month difference buys a 2× memory margin. Nano is a defensible choice with
+the hardening above; micro is the one I'd pick. CPU is not the concern either
+way — 2 vCPU burstable is far more than these callback volumes need.
 
 ### Recovering payments missed during downtime
 
@@ -458,7 +561,7 @@ Already-known transactions are skipped by TransID, so this is safe to re-run.
 | App exits on boot with a Firebase error | `FIREBASE_SERVICE_ACCOUNT` is malformed — usually the `\n` inside `private_key` got mangled. Regenerate it. |
 | STK push returns ResponseCode 0 but no prompt; query says `4999` | Wrong credentials. `mpesa.js` already forces EAT (UTC+3) for the password timestamp, so this is a `SHORTCODE`/`PASSKEY` mismatch — the passkey must belong to that till. |
 | Callbacks never arrive | Safaricom is still pointed at the old Render URL. Redo Step 11. |
-| `502 Bad Gateway` from Nginx | The Node process is down: `pm2 status`, `pm2 logs`. |
+| `502 Bad Gateway` from Nginx | The Node process is down: `sudo systemctl status selete-agro`, `journalctl -u selete-agro -n 50`. |
 | Instance IP changed after a reboot | You skipped the Elastic IP (Step 2). |
 
 ---
