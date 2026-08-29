@@ -225,6 +225,26 @@ Firebase private key and M-Pesa secrets:
 chmod 600 /var/www/selete-agro-backend/.env
 ```
 
+> **Write every URL out in full — `.env` does not expand variables.** It is
+> tempting to write `DOMAIN=api.example.com` and then
+> `CALLBACK_URL=${DOMAIN}/api/mpesa/callback`. This app uses `dotenv`, which
+> does **no** interpolation (that is the separate `dotenv-expand` package), so
+> the value becomes the literal string `${DOMAIN}/api/mpesa/callback`. It fails
+> silently: the app starts fine, `/api/c2b/register` returns
+> `ResponseCode 00000000`, and Safaricom cheerfully stores the nonsense URL —
+> you only find out when payments stop arriving. Note also that a bare hostname
+> is not enough; every URL needs the `https://` scheme.
+>
+> Verify what actually loaded before registering anything with Safaricom:
+> ```bash
+> cd /var/www/selete-agro-backend
+> node -e "require('dotenv').config(); \
+>   ['CALLBACK_URL','C2B_VALIDATION_URL','C2B_CONFIRMATION_URL','PULL_CALLBACK_URL', \
+>    'ACCOUNT_BALANCE_RESULT_URL','ACCOUNT_BALANCE_TIMEOUT_URL'] \
+>   .forEach(k => console.log(k, '=', process.env[k]))"
+> ```
+> Every line must start with `https://`.
+
 > **Generating the one-line `FIREBASE_SERVICE_ACCOUNT`:** on your local machine
 > run `node -e "console.log(JSON.stringify(require('./firebase-key.json')))"`
 > and paste the output. The `\n` escapes inside `private_key` must survive
@@ -436,7 +456,19 @@ silently ~60 days later. Leave 80 open.
 **This is the step people forget, and it's the one that loses money.** Until you
 do it, Safaricom is still posting confirmations to the old Render URL.
 
-Register the C2B validation/confirmation URLs:
+First confirm the app is holding the URLs you think it is. Safaricom accepts
+whatever string you send and returns success either way, so a typo here is
+stored silently and only surfaces as missing payments:
+
+```bash
+cd /var/www/selete-agro-backend
+node -e "require('dotenv').config(); \
+  ['C2B_VALIDATION_URL','C2B_CONFIRMATION_URL','PULL_CALLBACK_URL'] \
+  .forEach(k => console.log(k, '=', process.env[k]))"
+```
+
+Every line must start with `https://` and name your real domain. Then register
+the C2B validation/confirmation URLs:
 
 ```bash
 curl -X POST https://api.yourdomain.com/api/c2b/register
@@ -453,6 +485,18 @@ success, not an error.
 
 Then in the **Daraja portal**, update the STK Push callback URL for your app to
 `https://api.yourdomain.com/api/mpesa/callback`.
+
+Confirm what was actually sent — the handler logs both URLs immediately before
+calling Safaricom (`src/routes/c2b.js:66-74`):
+
+```bash
+journalctl -u selete-agro -n 30 | grep -i url
+```
+
+Registering again simply overwrites the stored URLs, so if you got it wrong,
+fix `.env`, `sudo systemctl restart selete-agro`, and re-run the register calls.
+Payments that arrived while a bad URL was registered are recoverable for 48
+hours — see [recovering payments](#recovering-payments-missed-during-downtime).
 
 ---
 
