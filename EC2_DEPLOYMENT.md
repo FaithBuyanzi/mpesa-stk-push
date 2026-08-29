@@ -483,6 +483,25 @@ curl -X POST https://api.yourdomain.com/api/mpesa/pull/register
 `ResponseCode 1001` from the Pull register means "already registered" — that is
 success, not an error.
 
+> **Pull Transactions is a separate Daraja product subscription.** Having Lipa
+> Na M-Pesa Online and Customer To Business on your app does not grant it. If
+> the app is not subscribed, Safaricom rejects the call with a misleading
+> `401.001 "Invalid Access Token"` — misleading because the token is fine; it
+> just carries no scope for that product. The giveaway is that
+> `/api/c2b/register` succeeds moments earlier using the identical token from
+> the identical `getMpesaAccessToken()` call.
+>
+> Fix it on developer.safaricom.co.ke under My Apps by adding the product to
+> the **existing** app — creating a new app issues new credentials, which would
+> also disturb STK and C2B. Pull may additionally need enabling on the shortcode
+> by Safaricom; if the portal shows it subscribed and 401 persists, mail
+> apisupport@safaricom.co.ke quoting the `requestId` from the error response.
+>
+> This does not block the migration — C2B confirmations still arrive normally.
+> It only means the 48-hour recovery path below is unavailable until fixed, so
+> any callbacks missed in the meantime must be reconciled by hand from the
+> M-Pesa statement.
+
 Then in the **Daraja portal**, update the STK Push callback URL for your app to
 `https://api.yourdomain.com/api/mpesa/callback`.
 
@@ -661,7 +680,8 @@ Already-known transactions are skipped by TransID, so this is safe to re-run.
 | `systemctl reload caddy` fails for any other reason | `sudo caddy validate --config /etc/caddy/Caddyfile` names the line. Caddy swaps configs atomically, so the running site is unaffected until a reload succeeds. |
 | App exits on boot with a Firebase error | `FIREBASE_SERVICE_ACCOUNT` is malformed — usually the `\n` inside `private_key` got mangled. Regenerate it. |
 | STK push returns ResponseCode 0 but no prompt; query says `4999` | Wrong credentials. `mpesa.js` already forces EAT (UTC+3) for the password timestamp, so this is a `SHORTCODE`/`PASSKEY` mismatch — the passkey must belong to that till. |
-| Callbacks never arrive | Safaricom is still pointed at the old Render URL. Redo Step 11. |
+| Callbacks never arrive | Safaricom is still pointed at the old Render URL, or at a malformed one. Redo Step 11 — and run the `.env` pre-flight check first. |
+| `401.001 Invalid Access Token` on `/api/mpesa/pull/register` only | The token is fine (C2B register works with the same one). The Daraja app is not subscribed to the Pull Transactions product. See the note in Step 11. |
 | `502 Bad Gateway` from Caddy | The Node process is down: `sudo systemctl status selete-agro`, `journalctl -u selete-agro -n 50`. |
 | Instance IP changed after a reboot | You skipped the Elastic IP (Step 2). |
 
