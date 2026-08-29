@@ -135,6 +135,33 @@ router.get("/api/mpesa/pull/query", async (req, res) => {
     console.log("EndDate:", endDate);
     console.log("Offset:", offset);
 
+    // Safaricom only retains pullable transactions for 48 hours. A wider
+    // window is not an error on their side - it just comes back empty, which
+    // is indistinguishable from "no payments were missed" unless we say so.
+    const startMs = Date.parse(String(startDate).replace(" ", "T"));
+    const endMs = Date.parse(String(endDate).replace(" ", "T"));
+
+    if (!isNaN(startMs) && !isNaN(endMs)) {
+      const hours = (endMs - startMs) / 36e5;
+
+      if (hours > 48) {
+        console.warn(
+          `⚠️ Requested window is ${hours.toFixed(1)}h. Safaricom's Pull API only ` +
+            "retains 48 hours - anything older will not be returned, and an empty " +
+            "result here does NOT mean no payments were missed."
+        );
+      }
+
+      const ageHours = (Date.now() - startMs) / 36e5;
+
+      if (ageHours > 48) {
+        console.warn(
+          `⚠️ StartDate is ${ageHours.toFixed(1)}h ago, beyond the 48h retention ` +
+            "window. Use a StartDate within the last 48 hours."
+        );
+      }
+    }
+
     const shortCode = OWN_SHORTCODE;
     const accessToken = await getMpesaAccessToken();
 
@@ -158,6 +185,16 @@ router.get("/api/mpesa/pull/query", async (req, res) => {
       timeout: MPESA_HTTP_TIMEOUT,
     });
 
+    // Log the raw body before interpreting it. This is a recovery endpoint -
+    // when it returns nothing, the only way to tell "no missed payments" from
+    // "Safaricom answered in a shape we don't parse" is to see what arrived.
+    console.log(
+      "Raw Pull query response:",
+      typeof response.data === "string"
+        ? response.data
+        : JSON.stringify(response.data)
+    );
+
     const responseCode = response.data?.ResponseCode;
 
     // Safaricom nests results as an array of arrays; flatten defensively.
@@ -168,6 +205,14 @@ router.get("/api/mpesa/pull/query", async (req, res) => {
     console.log(
       `Pull query returned ${rawTransactions.length} transaction(s), ResponseCode ${responseCode}`
     );
+
+    if (responseCode === undefined) {
+      console.warn(
+        "⚠️ No ResponseCode in Safaricom's reply. Either the response shape " +
+          "changed, or the request body never reached them - see the raw " +
+          "response logged above before trusting the 0-transaction result."
+      );
+    }
 
     const recovered = [];
     const alreadyKnown = [];
