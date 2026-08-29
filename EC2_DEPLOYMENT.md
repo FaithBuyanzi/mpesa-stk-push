@@ -361,15 +361,22 @@ api.yourdomain.com {
     }
 
     encode gzip
-
-    log {
-        output file /var/log/caddy/access.log {
-            roll_size 10MB
-            roll_keep 5
-        }
-    }
 }
 ```
+
+Access logs go to journald by default, which is where `journalctl -u caddy`
+reads from and which Step 8 already size-capped — so there is nothing else to
+configure.
+
+> **Don't add a `log { output file ... }` block without creating the directory
+> first.** Caddy runs as the unprivileged `caddy` user; if `/var/log/caddy`
+> doesn't exist or isn't writable by it, `systemctl reload caddy` fails with
+> `setting up custom log 'log0': opening log writer`. If you do want a separate
+> access-log file:
+> ```bash
+> sudo mkdir -p /var/log/caddy
+> sudo chown caddy:caddy /var/log/caddy
+> ```
 
 Caddy sets `X-Forwarded-For`, `X-Forwarded-Proto` and `Host` on proxied requests
 by default, and redirects HTTP → HTTPS automatically. There is nothing to add
@@ -605,7 +612,9 @@ Already-known transactions are skipped by TransID, so this is safe to re-run.
 | Symptom | Cause / fix |
 |---|---|
 | `curl` from outside times out | Security group missing 80/443, or `ufw` blocking. Check both. |
-| Caddy cannot obtain a certificate | A record not propagated, or port 80 closed. Run `dig +short api.yourdomain.com`, then `journalctl -u caddy | grep -i certificate` for the actual reason. |
+| Caddy cannot obtain a certificate | A record not propagated, or port 80 closed. Run `dig +short api.yourdomain.com`, then `journalctl -u caddy -n 50` for the actual reason. |
+| `systemctl reload caddy` fails, `opening log writer` | A `log { output file ... }` block pointing at a directory the `caddy` user can't write. Drop the block (journald is the default) or `sudo mkdir -p /var/log/caddy && sudo chown caddy:caddy /var/log/caddy`. The old config keeps serving — a failed reload is not an outage. |
+| `systemctl reload caddy` fails for any other reason | `sudo caddy validate --config /etc/caddy/Caddyfile` names the line. Caddy swaps configs atomically, so the running site is unaffected until a reload succeeds. |
 | App exits on boot with a Firebase error | `FIREBASE_SERVICE_ACCOUNT` is malformed — usually the `\n` inside `private_key` got mangled. Regenerate it. |
 | STK push returns ResponseCode 0 but no prompt; query says `4999` | Wrong credentials. `mpesa.js` already forces EAT (UTC+3) for the password timestamp, so this is a `SHORTCODE`/`PASSKEY` mismatch — the passkey must belong to that till. |
 | Callbacks never arrive | Safaricom is still pointed at the old Render URL. Redo Step 11. |
