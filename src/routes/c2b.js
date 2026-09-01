@@ -6,6 +6,7 @@ const { C2B_REGISTER_URL, OWN_SHORTCODE, MPESA_HTTP_TIMEOUT } = require("../conf
 const { getMpesaAccessToken } = require("../services/mpesaAuth");
 const { findInvoiceForC2B } = require("../services/invoiceMatcher");
 const { recordMpesaPayment } = require("../services/paymentRecorder");
+const { resolveMsisdn, looksHashed } = require("../services/msisdnDecoder");
 const { parseMpesaTimestamp } = require("../utils/mpesaDates");
 
 const router = express.Router();
@@ -343,6 +344,21 @@ router.post(
       const c2bRef = db.collection("c2b_transactions").doc(TransID);
 
       // --------------------------------------------------------
+      // HASHED MSISDN
+      // --------------------------------------------------------
+      //
+      // Safaricom sends a SHA-256 of the payer's number rather
+      // than the number itself. Storing that in `phone` would put
+      // 64 hex characters where the app expects something it can
+      // text, so the hash goes in its own field and `phone` is
+      // left empty until it is decoded. Decoding is a third-party
+      // HTTP call and does not belong in front of the response to
+      // Safaricom - it happens in the async block below, a moment
+      // later, and updates this document in place.
+      //
+      const phoneIsHashed = looksHashed(MSISDN);
+
+      // --------------------------------------------------------
       // ATOMIC DUPLICATE CHECK
       // --------------------------------------------------------
       //
@@ -367,7 +383,9 @@ router.post(
           invoiceNumber: InvoiceNumber || "",
           organizationAccountBalance: OrgAccountBalance || "",
           thirdPartyTransactionId: ThirdPartyTransID || "",
-          phone: MSISDN || "",
+          phone: phoneIsHashed ? "" : MSISDN || "",
+          phoneHash: phoneIsHashed ? String(MSISDN).toLowerCase() : "",
+          phoneDecoded: !phoneIsHashed && !!MSISDN,
           firstName: FirstName || "",
           middleName: MiddleName || "",
           lastName: LastName || "",
@@ -413,6 +431,30 @@ router.post(
       (async () => {
         let firestoreResult = "unknown";
         let matchedInvoiceId = null;
+        let phone = phoneIsHashed ? null : MSISDN || null;
+
+        // Done before matching so everything written below - the
+        // invoice payment record, the unmatched_payments row - gets
+        // the real number rather than the hash. A failure here is
+        // ordinary: the daily decode quota can be spent, or the
+        // number may not be in their table. Nothing downstream
+        // depends on knowing it.
+        if (phoneIsHashed) {
+          try {
+            phone = await resolveMsisdn(MSISDN);
+            await c2bRef.update({
+              phone: phone || "",
+              phoneDecoded: !!phone,
+            });
+            console.log(
+              phone
+                ? "Payer MSISDN decoded from hash"
+                : "Payer MSISDN could not be decoded - left blank"
+            );
+          } catch (err) {
+            console.error("MSISDN decode failed:", err.message);
+          }
+        }
 
         try {
           const { invoice, strategy } = await findInvoiceForC2B({
@@ -427,7 +469,7 @@ router.post(
               invoiceId: invoice.id,
               amount,
               receipt: TransID,
-              phone: MSISDN,
+              phone: phone,
               transactionDate: TransTime,
               source: "c2b",
               extra: {
@@ -460,7 +502,7 @@ router.post(
                 BusinessShortCode || process.env.SHORTCODE || ""
               }, BillRef: ${BillRefNumber || "none"}`,
               customerName: customerName || null,
-              customerPhone: MSISDN || null,
+              customerPhone: phone || null,
               amount,
               reference: TransID,
               transactionDate: admin.firestore.Timestamp.fromDate(

@@ -11,6 +11,7 @@ const {
 const { getMpesaAccessToken } = require("../services/mpesaAuth");
 const { findInvoiceForC2B } = require("../services/invoiceMatcher");
 const { recordMpesaPayment } = require("../services/paymentRecorder");
+const { resolveMsisdn, looksHashed } = require("../services/msisdnDecoder");
 const { parseMpesaTimestamp } = require("../utils/mpesaDates");
 
 const router = express.Router();
@@ -226,6 +227,19 @@ router.get("/api/mpesa/pull/query", async (req, res) => {
       const amount = parseFloat(t.amount) || 0;
       const c2bRef = db.collection("c2b_transactions").doc(transactionId);
 
+      // Same hashed-MSISDN problem as the live confirmation
+      // callback, and the same answer. Decoded inline here rather
+      // than afterwards because nothing is waiting on this route:
+      // it is a manual reconciliation run, not a Safaricom
+      // callback with a response deadline. Cached decodes make
+      // re-running a window over the same payers nearly free.
+      const phoneIsHashed = looksHashed(t.msisdn);
+      const phone = phoneIsHashed
+        ? await resolveMsisdn(t.msisdn)
+        : t.msisdn
+        ? String(t.msisdn)
+        : null;
+
       try {
         await c2bRef.create({
           transactionType: t.transactiontype || "Pay Bill",
@@ -238,7 +252,9 @@ router.get("/api/mpesa/pull/query", async (req, res) => {
           invoiceNumber: "",
           organizationAccountBalance: "",
           thirdPartyTransactionId: "",
-          phone: t.msisdn ? String(t.msisdn) : "",
+          phone: phone || "",
+          phoneHash: phoneIsHashed ? String(t.msisdn).toLowerCase() : "",
+          phoneDecoded: !!phone,
           firstName: "",
           middleName: "",
           lastName: "",
@@ -284,7 +300,7 @@ router.get("/api/mpesa/pull/query", async (req, res) => {
             invoiceId: invoice.id,
             amount,
             receipt: transactionId,
-            phone: t.msisdn,
+            phone: phone,
             transactionDate: t.trxDate,
             source: "pull",
             extra: {
@@ -311,7 +327,7 @@ router.get("/api/mpesa/pull/query", async (req, res) => {
               t.billreference || "none"
             }`,
             customerName: t.sender || null,
-            customerPhone: t.msisdn ? String(t.msisdn) : null,
+            customerPhone: phone || null,
             amount,
             reference: transactionId,
             transactionDate: admin.firestore.Timestamp.fromDate(
