@@ -41,42 +41,23 @@ build with nothing to move to. The app clamps it, but do not rely on that.
 
 ## Steps
 
-From the `selete-agro` repository:
+The full release procedure — versioning, building, signing, hashing,
+uploading and the website — lives in `RELEASING.md` at the root of the
+`selete-agro` app repository. It is one loop across three repositories and
+is kept in one place so it cannot drift.
 
-```bash
-# 1. Raise the version. The +N suffix is the build number.
-#    Edit pubspec.yaml:  version: 0.2.0+2
-
-flutter build apk --release
-flutter build windows --release
-```
-
-Package and hash:
-
-```bash
-sha256sum build/app/outputs/flutter-apk/app-release.apk
-```
-
-Android ships as a **bare .apk**, not a zip — the installer needs the file
-itself. The password-protected zips on the products page are a separate
-thing, for reviewers.
-
-Upload both to the website box:
-
-```bash
-scp -i <key.pem> \
-  SeleteAgro-FarmManager-Android-v0.2.0.apk \
-  SeleteAgro-FarmManager-Windows-x64-v0.2.0.zip \
-  ubuntu@info.seleteagro.store:/var/www/selete-agro-website/downloads/
-```
-
-Then edit `android.json` and `windows.json` here — `version`, `build`,
-`url`, `sha256`, `sizeBytes`, `notes`, `releasedAt` — and `git pull` on the
-backend box. Confirm:
+What belongs here is only the last part of it: edit `android.json` and
+`windows.json` with the new `version`, `build`, `url`, `sha256`,
+`sizeBytes`, `notes` and `releasedAt`, then confirm:
 
 ```bash
 curl -s https://api.seleteagro.store/updates/android | jq .
+curl -sI https://info.seleteagro.store/downloads/<the file named in url> | head -1
 ```
+
+Android ships as a **bare .apk**, not a zip — the installer needs the file
+itself. Windows ships as a zip of the release folder, and it must never be
+password-protected: the updater unpacks it without a person present.
 
 ## The checksum is the whole of the security
 

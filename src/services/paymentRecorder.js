@@ -134,6 +134,16 @@ async function recordMpesaPayment({
         amount,
         date: new Date(),
         paymentMethod: "mpesa",
+
+        // The id of the reconciliation document written just above.
+        //
+        // Without it the app cannot tell that these two records are one
+        // payment, and the invoice screen draws both: the entry as a plain
+        // line, and the reconciliation again underneath carrying the
+        // edit/delete menu. One payment, two rows, only one of them
+        // actionable. See _PaymentHistoryCard in
+        // lib/screens/sales/invoice_detail_screen.dart.
+        sourceId: reconciliationRef.id,
       };
 
       transaction.update(invoiceRef, {
@@ -153,6 +163,7 @@ async function recordMpesaPayment({
         newAmountPaid,
         paymentStatus,
         invoiceNumber: invoiceData.invoiceNumber,
+        reconciliationId: reconciliationRef.id,
       };
     });
 
@@ -170,4 +181,56 @@ async function recordMpesaPayment({
   }
 }
 
-module.exports = { recordMpesaPayment };
+// ============================================================
+// ATTRIBUTING THE TILL PAYMENT ITSELF
+// ============================================================
+//
+// Recording the payment on the invoice is only half of a match. The
+// c2b_transactions document also has to say where the money went, because
+// that is what the app reads to decide whether a Till payment still needs
+// a sale recorded against it.
+//
+// It used to write only `matched` and `matchedInvoiceId`. The app reads
+// `allocations` — the same field the in-app matching screens write — so an
+// auto-matched payment showed "No sale recorded for this money" on a
+// payment that was, in fact, already on an invoice. Anyone acting on that
+// screen would have raised a second invoice for money already collected.
+//
+// Returns the fields to merge into the c2b_transactions document.
+function tillPaymentMatchFields({ invoice, amount, strategy, result, source }) {
+  const recorded = !!(result && result.recorded);
+
+  if (!recorded) {
+    // Matched to an invoice but nothing was written to it — a duplicate
+    // receipt, or the invoice vanished. The money is still unattributed,
+    // and the app should keep offering it for manual matching.
+    return { matched: false, matchedInvoiceId: invoice.id, matchStrategy: strategy };
+  }
+
+  return {
+    matched: true,
+    matchedInvoiceId: invoice.id,
+    matchStrategy: strategy,
+
+    // Same shape as PaymentAllocation.toMap() in
+    // lib/models/till_payment.dart. A single-invoice split: auto-matching
+    // only ever puts the whole payment on one invoice.
+    allocations: [
+      {
+        invoiceId: invoice.id,
+        invoiceNumber: result.invoiceNumber || "",
+        amount,
+      },
+    ],
+    allocatedAmount: amount,
+
+    matchedAt: admin.firestore.FieldValue.serverTimestamp(),
+    matchedByUid: "system",
+    matchedByName:
+      source === "pull"
+        ? "M-Pesa Auto-Match (Pull API Recovery)"
+        : "M-Pesa Auto-Match (Till/C2B)",
+  };
+}
+
+module.exports = { recordMpesaPayment, tillPaymentMatchFields };

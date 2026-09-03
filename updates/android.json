@@ -1,10 +1,10 @@
 {
-  "version": "0.1.0",
-  "build": 1,
+  "version": "1.0.1",
+  "build": 2,
   "minSupportedBuild": 0,
-  "url": "https://info.seleteagro.store/downloads/SeleteAgro-FarmManager-Android-v0.1.0.apk",
-  "sha256": "f46c46b9f6ec1bac19691f1e169d86bec37986796eeb2a8f7715ce1561927b57",
-  "sizeBytes": 72282631,
-  "notes": "First release.",
-  "releasedAt": "2026-09-02T00:00:00Z"
+  "url": "https://info.seleteagro.store/downloads/SeleteAgro-FarmManager-Android-v1.0.1.apk",
+  "sha256": "c18f8e0b54fd23172f9ba3f79b9175404afb16165846a5cba2ef6af12e68228d",
+  "sizeBytes": 72890055,
+  "notes": "Fixes a Till payment showing twice on an invoice, and a matched payment still asking to be matched. Egg collection gains a trend graph. The thank-you text can now be edited in System Configuration.",
+  "releasedAt": "2026-09-03T00:00:00Z"
 }

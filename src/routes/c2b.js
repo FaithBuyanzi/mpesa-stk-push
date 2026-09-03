@@ -5,7 +5,10 @@ const { admin, db } = require("../../firebase");
 const { C2B_REGISTER_URL, OWN_SHORTCODE, MPESA_HTTP_TIMEOUT } = require("../config");
 const { getMpesaAccessToken } = require("../services/mpesaAuth");
 const { findInvoiceForC2B } = require("../services/invoiceMatcher");
-const { recordMpesaPayment } = require("../services/paymentRecorder");
+const {
+  recordMpesaPayment,
+  tillPaymentMatchFields,
+} = require("../services/paymentRecorder");
 const { resolveMsisdn, looksHashed } = require("../services/msisdnDecoder");
 const { parseMpesaTimestamp } = require("../utils/mpesaDates");
 
@@ -486,11 +489,15 @@ router.post(
               },
             });
 
-            await c2bRef.update({
-              matched: !!result.recorded,
-              matchedInvoiceId: invoice.id,
-              matchStrategy: strategy,
-            });
+            await c2bRef.update(
+              tillPaymentMatchFields({
+                invoice,
+                amount,
+                strategy,
+                result,
+                source: "c2b",
+              })
+            );
 
             firestoreResult = result.recorded
               ? `matched invoice ${invoice.id} via ${strategy}, invoice updated`

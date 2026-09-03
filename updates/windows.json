@@ -1,10 +1,10 @@
 {
-  "version": "0.1.0",
-  "build": 1,
+  "version": "1.0.1",
+  "build": 2,
   "minSupportedBuild": 0,
-  "url": "https://info.seleteagro.store/downloads/SeleteAgro-FarmManager-Windows-x64-v0.1.0.zip",
-  "sha256": "c4a90d4320eb9f13fd8446cff558b31cedcfd7d3d97e4ce94e0597fea103ddfa",
-  "sizeBytes": 20577105,
-  "notes": "First release.",
-  "releasedAt": "2026-09-02T00:00:00Z"
+  "url": "https://info.seleteagro.store/downloads/SeleteAgro-FarmManager-Windows-x64-v1.0.1.zip",
+  "sha256": "73235b591aab02025bf6070da10a49731a2d2fa4ca990590f7e82d23d94ac60a",
+  "sizeBytes": 20049852,
+  "notes": "Fixes a Till payment showing twice on an invoice, and a matched payment still asking to be matched. Egg collection gains a trend graph. The thank-you text can now be edited in System Configuration.",
+  "releasedAt": "2026-09-03T00:00:00Z"
 }
