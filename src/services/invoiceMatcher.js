@@ -1,4 +1,13 @@
-const { db } = require("../../firebase");
+// Required inside findInvoiceForC2B rather than at the top of the file, so
+// that everything above it — the date window, the name scoring, the
+// matching itself — can be imported and tested without Firebase
+// credentials. That is the whole of the decision-making in here; only the
+// one function that fetches candidates needs a database at all.
+//
+// See test/invoiceMatcher.test.js, which exists because of this.
+function firestore() {
+  return require("../../firebase").db;
+}
 
 // ============================================================
 // C2B INVOICE MATCHING
@@ -30,6 +39,54 @@ const { db } = require("../../firebase");
 // invoice is guessed.
 //
 const NAME_MATCH_MIN_SCORE = 75;
+
+// How far apart a payment and an invoice may be dated and still be taken
+// for the same transaction. Must stay in step with kMatchWindowDays in
+// lib/utils/payment_matching.dart, which is the same rule for the manual
+// matching card in the app.
+//
+// This used to be missing here entirely, and the invoice date was read
+// only as a tie-break for two candidates scoring the same on name. The
+// effect was that the app refused a match more than a week apart while
+// this quietly made it first: a Till payment arriving today could be
+// attributed to an unpaid invoice from six months ago, and by the time
+// anybody looked at the payment it was already spoken for. The window in
+// the app was doing nothing except on the leftovers.
+const MATCH_WINDOW_DAYS = 7;
+
+// Whole days between two instants, ignoring the time of day.
+//
+// Compared as calendar dates, the same way daysBetweenDates does it in
+// payment_matching.dart: a payment at 23:50 and an invoice raised at 00:10
+// the next morning are one day apart, not zero.
+function daysBetweenDates(a, b) {
+  const dayA = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate());
+  const dayB = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate());
+  return Math.abs(Math.round((dayA - dayB) / 86400000));
+}
+
+// Candidates dated within MATCH_WINDOW_DAYS of the payment.
+//
+// An invoice with no usable date is dropped rather than kept. Keeping it
+// would mean a document the matcher cannot place in time is the one thing
+// the window never applies to, which is exactly backwards — and every
+// invoice the app writes carries a date, so this only ever catches
+// something already wrong.
+function withinWindow(candidates, paymentDate) {
+  if (!(paymentDate instanceof Date) || Number.isNaN(paymentDate.getTime())) {
+    // No usable payment date: match nothing automatically rather than
+    // match everything. A payment left unattributed is a job for somebody;
+    // a payment on the wrong invoice is a customer chasing a receipt for a
+    // sale they have already paid for.
+    return [];
+  }
+  return candidates.filter(
+    (c) =>
+      c.dateMillis > 0 &&
+      daysBetweenDates(new Date(c.dateMillis), paymentDate) <=
+        MATCH_WINDOW_DAYS
+  );
+}
 
 function normalizeNameForMatch(name) {
   return String(name || "")
@@ -132,10 +189,25 @@ function pickBestNameMatch(paymentName, candidates, minScore) {
   return best[0];
 }
 
-function matchInvoiceForPayment({ paymentName, paymentAmount, candidates }) {
+// paymentDate is required. Called without one, nothing matches — see
+// withinWindow. That is deliberate rather than defensive: an automatic
+// matcher that falls back to "no date rule" the moment a caller forgets to
+// pass a date is a matcher whose date rule is optional in practice.
+function matchInvoiceForPayment({
+  paymentName,
+  paymentAmount,
+  paymentDate,
+  candidates,
+}) {
   if (candidates.length === 0) return null;
 
-  const exactAmountMatches = candidates.filter(
+  // Applied before amount and name, not after. An invoice from March whose
+  // balance happens to equal today's payment is not a near-miss to be
+  // scored — it is not a candidate at all.
+  const inWindow = withinWindow(candidates, paymentDate);
+  if (inWindow.length === 0) return null;
+
+  const exactAmountMatches = inWindow.filter(
     (c) => Math.abs(c.balanceDue - paymentAmount) < 0.01
   );
 
@@ -144,11 +216,11 @@ function matchInvoiceForPayment({ paymentName, paymentAmount, candidates }) {
     if (best) return best;
   }
 
-  return pickBestNameMatch(paymentName, candidates, NAME_MATCH_MIN_SCORE);
+  return pickBestNameMatch(paymentName, inWindow, NAME_MATCH_MIN_SCORE);
 }
 
-async function findInvoiceForC2B({ amount, customerName }) {
-  const openInvoices = await db
+async function findInvoiceForC2B({ amount, customerName, paymentDate }) {
+  const openInvoices = await firestore()
     .collection("invoices")
     .where("paymentStatus", "in", ["unpaid", "partiallyPaid"])
     .get();
@@ -170,6 +242,7 @@ async function findInvoiceForC2B({ amount, customerName }) {
   const matched = matchInvoiceForPayment({
     paymentName: customerName,
     paymentAmount: amount,
+    paymentDate: paymentDate instanceof Date ? paymentDate : new Date(),
     candidates,
   });
 
@@ -181,6 +254,9 @@ async function findInvoiceForC2B({ amount, customerName }) {
 }
 
 module.exports = {
+  MATCH_WINDOW_DAYS,
+  daysBetweenDates,
+  withinWindow,
   NAME_MATCH_MIN_SCORE,
   normalizeNameForMatch,
   levenshtein,

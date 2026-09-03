@@ -572,7 +572,178 @@ Once real payments are confirmed landing on EC2:
 
 ---
 
-## Redeploying after a code change
+## Step 15 — The marketing site on the same box
+
+`info.seleteagro.store` serves
+[FaithBuyanzi/Selete-Agro-website](https://github.com/FaithBuyanzi/Selete-Agro-website)
+— plain HTML, CSS and JavaScript with no build step and no server side. Its
+contact and internship forms post to Formspree, so it never touches the API
+next door and needs no CORS arrangement between the two names.
+
+That means Caddy serves it directly from disk. There is no second Node
+process, no second systemd unit, and nothing new to keep alive: the whole
+addition to this machine's running cost is one more virtual host and ~13 MB
+of static files.
+
+### 15a. DNS first
+
+Add an A record for `info` pointing at the same Elastic IP as `api`, and wait
+for it to resolve before touching Caddy — Caddy asks Let's Encrypt for a
+certificate the moment the config loads, and a name that does not yet resolve
+fails that challenge and then backs off.
+
+```bash
+dig +short info.seleteagro.store   # must print the Elastic IP
+```
+
+### 15b. Clone it
+
+```bash
+cd /var/www
+git clone https://github.com/FaithBuyanzi/Selete-Agro-website.git selete-agro-website
+```
+
+The repository is private, so this prompts for GitHub credentials. Use a
+personal access token as the password (`repo` scope, or `Contents: read` on a
+fine-grained token) — GitHub has not accepted account passwords over HTTPS
+since 2021. To avoid retyping it on every pull:
+
+```bash
+git config --global credential.helper 'store --file ~/.git-credentials'
+chmod 600 ~/.git-credentials    # after the first successful pull
+```
+
+That writes the token to disk in plain text, readable only by `ubuntu`. It is
+a read-only token for a marketing site on a box you already hold the SSH key
+for, so the exposure is small — but if that is not a trade you want, use a
+deploy key instead and clone over SSH.
+
+Caddy runs as the unprivileged `caddy` user and only needs to read these
+files. A normal clone leaves them world-readable, which is enough; there is no
+`chown` step and Caddy must never own the working tree, or a `git pull` will
+be fighting it for permissions.
+
+### 15c. Add the vhost
+
+`/etc/caddy/Caddyfile`, alongside the existing `api` block:
+
+```caddyfile
+info.seleteagro.store {
+        root * /var/www/selete-agro-website
+
+        # /about as well as /about.html, without duplicating any pages.
+        try_files {path} {path}.html {path}/index.html
+        file_server
+
+        encode gzip
+
+        # The images are the bulk of the site and change only when someone
+        # replaces a photo. A month of browser caching keeps repeat visits
+        # off this instance's modest bandwidth.
+        header /images/* Cache-Control "public, max-age=2592000"
+        header /css/* Cache-Control "public, max-age=86400"
+        header /js/*  Cache-Control "public, max-age=86400"
+}
+```
+
+Then:
+
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+journalctl -u caddy -f          # look for "certificate obtained successfully"
+```
+
+Verify from your own machine rather than from the instance, so that DNS and
+the certificate are exercised for real:
+
+```bash
+curl -I https://info.seleteagro.store
+curl -I https://api.seleteagro.store/health   # confirm the API is untouched
+```
+
+### 15d. Updating the site
+
+```bash
+cd /var/www/selete-agro-website
+git pull
+```
+
+That is the whole deployment. No restart and no reload — Caddy reads the files
+off disk per request, so a `git pull` is live the moment it finishes.
+
+### 15e. The app downloads
+
+`products.html` offers the Android and Windows builds of Selete Agro Farm
+Manager for download. Those archives are **not** in the repository — they are
+tens of megabytes each, a new pair lands every release, and GitHub refuses
+anything over 100 MB outright. They are copied straight onto the box:
+
+```bash
+scp -i <your-key.pem> \
+  SeleteAgro-FarmManager-Android-v<version>.zip \
+  SeleteAgro-FarmManager-Windows-x64-v<version>.zip \
+  ubuntu@info.seleteagro.store:/var/www/selete-agro-website/downloads/
+```
+
+`downloads/.gitignore` in the site repo excludes everything in that folder, so
+a `git pull` never disturbs what is already there and never tries to bring the
+archives down. Nothing to reload afterwards — `file_server` picks them up
+immediately.
+
+Two things to keep in mind:
+
+- **Update the checksums.** `products.html` prints a SHA-256 beside each
+  download. It is the only way a reviewer can tell the file they received is
+  the file you published, so a stale one is worse than none at all.
+- **Bandwidth.** Each download is ~20–30 MB out of this instance. That is
+  nothing for a handful of reviewers and something to watch if the page ever
+  gets real traffic; at that point the archives belong on object storage with
+  the page linking out to it, not on the application server.
+
+---
+
+## Step 16 — In-app updates
+
+The app checks `https://api.seleteagro.store/updates/android` (or
+`/updates/windows`) at start-up, compares build numbers, and offers or
+demands the newer one. Two JSON files in `updates/` on this box are the
+whole of a release — see `updates/README.md` for the fields and the
+procedure.
+
+Nothing to install and nothing to configure here: the router ships with the
+backend, and the files are read per request, so publishing a release is
+editing a file and running `git pull`. **A release must never require
+restarting this service**, because that would take the Till offline to ship
+an app update.
+
+The binaries themselves are served by Caddy from
+`/var/www/selete-agro-website/downloads/` — the same place the products
+page links to. They deliberately do not go through Node: a 70 MB transfer
+on this event loop would compete with Safaricom's payment callbacks, which
+have a deadline.
+
+Confirm after a deploy:
+
+```bash
+curl -s https://api.seleteagro.store/updates/android | jq .
+curl -sI https://info.seleteagro.store/downloads/SeleteAgro-FarmManager-Android-v0.1.0.apk | head -1
+```
+
+The second one matters as much as the first. A manifest pointing at a file
+that is not there means every phone tries to update, fails, and tries again
+tomorrow.
+
+### Making an update mandatory
+
+`minSupportedBuild` in the manifest. Set it to a build number and every
+older install is stopped until it updates; leave it and older installs get
+a dismissible banner. It is a per-release decision, not a policy — see
+`updates/README.md` for why.
+
+---
+
+## Redeploying the backend after a code change
 
 ```bash
 cd /var/www/selete-agro-backend
@@ -597,6 +768,7 @@ sudo systemctl restart selete-agro      # restart
 systemd-cgtop                           # per-service CPU / memory
 sudo systemctl reload caddy             # after editing /etc/caddy/Caddyfile
 journalctl -u caddy -f                  # proxy + TLS renewal logs
+cd /var/www/selete-agro-website && git pull   # publish website changes (no reload)
 df -h                                   # disk
 free -h                                 # memory + swap
 vmstat 1                                # si/so columns = active swapping

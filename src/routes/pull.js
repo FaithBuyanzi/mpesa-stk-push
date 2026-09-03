@@ -293,6 +293,11 @@ router.get("/api/mpesa/pull/query", async (req, res) => {
         const { invoice, strategy } = await findInvoiceForC2B({
           amount,
           customerName: t.sender || "",
+          // The transaction's own time, which matters more here than on
+          // the callback route: a pull is run precisely because payments
+          // were missed, so "now" can be days after the money arrived and
+          // would widen the window by however long the gap was.
+          paymentDate: parseMpesaTimestamp(t.trxDate) || new Date(),
         });
 
         if (invoice) {

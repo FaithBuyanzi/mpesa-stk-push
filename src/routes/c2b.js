@@ -460,6 +460,12 @@ router.post(
           const { invoice, strategy } = await findInvoiceForC2B({
             amount,
             customerName,
+            // Safaricom's own time for the transaction, not the moment
+            // this callback happened to arrive. A confirmation delayed by
+            // a retry or an outage can turn up days late, and dating the
+            // match from arrival would quietly widen the window by
+            // exactly the length of the outage.
+            paymentDate: parseMpesaTimestamp(TransTime) || new Date(),
           });
 
           if (invoice) {

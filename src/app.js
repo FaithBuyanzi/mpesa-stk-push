@@ -8,6 +8,7 @@ const stkRoutes = require("./routes/stk");
 const c2bRoutes = require("./routes/c2b");
 const pullRoutes = require("./routes/pull");
 const accountBalanceRoutes = require("./routes/accountBalance");
+const updateRoutes = require("./routes/updates");
 
 // ============================================================
 // EXPRESS APP
@@ -35,6 +36,12 @@ function createApp() {
   app.use(c2bRoutes);
   app.use(pullRoutes);
   app.use(accountBalanceRoutes);
+
+  // App update manifests. Mounted under a prefix rather than declaring
+  // its own full paths like the M-Pesa routers, because these URLs are
+  // ours - nothing at Safaricom is configured against them, and
+  // /updates/:platform reads better as one router owning one prefix.
+  app.use("/updates", updateRoutes);
 
   return app;
 }
