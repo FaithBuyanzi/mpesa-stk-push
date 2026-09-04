@@ -1,10 +1,10 @@
 {
-  "version": "1.0.1",
-  "build": 2,
+  "version": "1.0.2",
+  "build": 3,
   "minSupportedBuild": 0,
-  "url": "https://info.seleteagro.store/downloads/SeleteAgro-FarmManager-Windows-x64-v1.0.1.zip",
-  "sha256": "73235b591aab02025bf6070da10a49731a2d2fa4ca990590f7e82d23d94ac60a",
-  "sizeBytes": 20049852,
-  "notes": "Fixes a Till payment showing twice on an invoice, and a matched payment still asking to be matched. Egg collection gains a trend graph. The thank-you text can now be edited in System Configuration.",
-  "releasedAt": "2026-09-03T00:00:00Z"
+  "url": "https://info.seleteagro.store/downloads/SeleteAgro-FarmManager-Windows-x64-v1.0.2.zip",
+  "sha256": "fd6eb7484a4fb8dba1036895e412659257ec5aa85d3eee700a3e7bbd12053945",
+  "sizeBytes": 20707405,
+  "notes": "An STK Push payment is no longer matched a second time as a Till payment. Financial Reports gains a Records tab showing every record behind the profit, with its full working, and now counts only flocks that are laying right now. Egg collection shows a trend line for each laying flock. Till payments have a screen of their own, and payment records can be repaired from anywhere.",
+  "releasedAt": "2026-09-04T00:00:00Z"
 }

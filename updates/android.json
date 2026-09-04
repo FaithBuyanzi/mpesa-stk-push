@@ -1,10 +1,10 @@
 {
-  "version": "1.0.1",
-  "build": 2,
+  "version": "1.0.2",
+  "build": 3,
   "minSupportedBuild": 0,
-  "url": "https://info.seleteagro.store/downloads/SeleteAgro-FarmManager-Android-v1.0.1.apk",
-  "sha256": "c18f8e0b54fd23172f9ba3f79b9175404afb16165846a5cba2ef6af12e68228d",
-  "sizeBytes": 72890055,
-  "notes": "Fixes a Till payment showing twice on an invoice, and a matched payment still asking to be matched. Egg collection gains a trend graph. The thank-you text can now be edited in System Configuration.",
-  "releasedAt": "2026-09-03T00:00:00Z"
+  "url": "https://info.seleteagro.store/downloads/SeleteAgro-FarmManager-Android-v1.0.2.apk",
+  "sha256": "a1f1cf6afbeed79a7f24c64c4d6a5c539bacbf474473c24e5688e335604787f1",
+  "sizeBytes": 73119651,
+  "notes": "An STK Push payment is no longer matched a second time as a Till payment. Financial Reports gains a Records tab showing every record behind the profit, with its full working, and now counts only flocks that are laying right now. Egg collection shows a trend line for each laying flock. Till payments have a screen of their own, and payment records can be repaired from the phone.",
+  "releasedAt": "2026-09-04T00:00:00Z"
 }
