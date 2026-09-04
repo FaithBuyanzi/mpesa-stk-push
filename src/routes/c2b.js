@@ -8,6 +8,7 @@ const { findInvoiceForC2B } = require("../services/invoiceMatcher");
 const {
   recordMpesaPayment,
   tillPaymentMatchFields,
+  findStkTransactionByReceipt,
 } = require("../services/paymentRecorder");
 const { resolveMsisdn, looksHashed } = require("../services/msisdnDecoder");
 const { parseMpesaTimestamp } = require("../utils/mpesaDates");
@@ -436,13 +437,102 @@ router.post(
         let matchedInvoiceId = null;
         let phone = phoneIsHashed ? null : MSISDN || null;
 
+        // ------------------------------------------------------
+        // WAS THIS AN STK PUSH?
+        // ------------------------------------------------------
+        //
+        // A Buy Goods payment made through an STK Push reaches us twice:
+        // once as the STK callback, which records it against the invoice
+        // the push was raised for, and once here. There is nothing for
+        // this handler to work out about such a payment - the invoice was
+        // chosen by the person who sent the push, and re-deriving it from
+        // the amount and the payer's name can only ever disagree with
+        // that. What is left to do is say on the Till payment where the
+        // money went, so it stops reading as "no sale recorded", and let
+        // the thank-you go out.
+        //
+        // See findStkTransactionByReceipt for why this is allowed to wait.
+        const stk = await findStkTransactionByReceipt(TransID);
+
+        if (stk && stk.phone) {
+          // The STK side holds the payer's real number. Taking it saves a
+          // decodehash call against a daily quota, and, more to the point,
+          // guarantees the thank-you can be sent even on a day the quota
+          // is spent.
+          phone = String(stk.phone);
+          try {
+            await c2bRef.update({ phone, phoneDecoded: true });
+          } catch (err) {
+            console.error(
+              "Could not copy the STK phone onto the Till payment:",
+              err.message
+            );
+          }
+        }
+
+        if (stk && stk.invoiceId) {
+          matchedInvoiceId = stk.invoiceId;
+
+          try {
+            const invoiceSnap = await db
+              .collection("invoices")
+              .doc(stk.invoiceId)
+              .get();
+
+            const invoiceNumber = invoiceSnap.exists
+              ? invoiceSnap.data().invoiceNumber || ""
+              : "";
+
+            await c2bRef.update({
+              ...tillPaymentMatchFields({
+                invoice: { id: stk.invoiceId },
+                amount,
+                strategy: "stk_push",
+                // The STK callback did the recording. Saying so here is
+                // what makes tillPaymentMatchFields attribute the money
+                // rather than reporting it unmatched.
+                result: {
+                  recorded: false,
+                  reason: "already_recorded",
+                  invoiceId: stk.invoiceId,
+                  invoiceNumber,
+                },
+                source: "c2b",
+              }),
+              stkCheckoutRequestId: stk.id || null,
+              // Overrides the auto-match wording: nothing was matched
+              // here, and saying so keeps somebody from looking for a
+              // matching rule that was never applied.
+              matchedByName: "M-Pesa STK Push",
+            });
+
+            firestoreResult =
+              "STK Push payment - already recorded on invoice " +
+              stk.invoiceId +
+              " by the STK callback, attributed here without re-matching";
+          } catch (err) {
+            console.error("Could not attribute the STK Till payment:", err);
+            firestoreResult = "error: " + err.message;
+          }
+
+          console.log("========== C2B PAYMENT ==========");
+          console.log("TransID:", TransID);
+          console.log("Invoice/Reference:", matchedInvoiceId);
+          console.log("Firestore result:", firestoreResult);
+          return;
+        }
+
+        // An STK Push raised without an invoice behind it leaves the money
+        // genuinely unattributed - nothing was recorded anywhere - so it
+        // carries on through the ordinary matching below.
+
         // Done before matching so everything written below - the
         // invoice payment record, the unmatched_payments row - gets
         // the real number rather than the hash. A failure here is
         // ordinary: the daily decode quota can be spent, or the
         // number may not be in their table. Nothing downstream
         // depends on knowing it.
-        if (phoneIsHashed) {
+        if (phoneIsHashed && !phone) {
           try {
             phone = await resolveMsisdn(MSISDN);
             await c2bRef.update({

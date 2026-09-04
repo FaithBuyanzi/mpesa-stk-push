@@ -34,6 +34,45 @@ async function recordMpesaPayment({
     return { recorded: false, reason: "no_invoice_id" };
   }
 
+  // ----------------------------------------------------------
+  // HAS THIS RECEIPT ALREADY BEEN BANKED, ANYWHERE?
+  // ----------------------------------------------------------
+  //
+  // The per-invoice guard inside the transaction below only asks whether
+  // *this* invoice already carries the receipt. That is not the question
+  // when the same money reaches us twice down two different paths, which
+  // is exactly what happens on every STK Push to the Till: Safaricom sends
+  // the STK callback AND a C2B confirmation for the one payment. The STK
+  // callback records it against the invoice it was raised for; the C2B
+  // handler then goes looking for an invoice by amount and name, and any
+  // invoice it lands on other than that one gets credited with money the
+  // customer never sent it.
+  //
+  // A reconciliation document is written for every recorded payment and
+  // carries the receipt in a queryable field, so it is the one place that
+  // can answer "is this receipt already on some invoice" cheaply.
+  const alreadyBanked = await findReconciliationByReceipt(receipt);
+
+  if (alreadyBanked) {
+    console.log(
+      "Receipt " +
+        receipt +
+        " is already recorded on invoice " +
+        alreadyBanked.invoiceId +
+        " - not recording it a second time (source: " +
+        source +
+        ")"
+    );
+
+    return {
+      recorded: false,
+      reason: "already_recorded",
+      invoiceId: alreadyBanked.invoiceId,
+      invoiceNumber: alreadyBanked.invoiceNumber || "",
+      reconciliationId: alreadyBanked.id,
+    };
+  }
+
   const invoiceRef = db.collection("invoices").doc(invoiceId);
 
   let outcome = { recorded: false, reason: "unknown" };
@@ -182,6 +221,89 @@ async function recordMpesaPayment({
 }
 
 // ============================================================
+// WHERE HAS THIS RECEIPT ALREADY LANDED?
+// ============================================================
+
+// The reconciliation record for `receipt`, if the money is already on an
+// invoice. Null when it is genuinely new.
+async function findReconciliationByReceipt(receipt) {
+  if (!receipt) return null;
+
+  try {
+    const snap = await db
+      .collection("payment_reconciliations")
+      .where("referenceCode", "==", receipt)
+      .limit(1)
+      .get();
+
+    if (snap.empty) return null;
+
+    const doc = snap.docs[0];
+    return { id: doc.id, ...doc.data() };
+  } catch (err) {
+    // A failure here must not stop a payment being recorded. The
+    // per-invoice guard inside the transaction still stands; this is the
+    // wider net, and a torn net is better than no payment at all.
+    console.error(
+      "Could not check for an existing reconciliation:",
+      err.message
+    );
+    return null;
+  }
+}
+
+// The STK Push this Till receipt came from, if it came from one.
+//
+// An STK Push is raised from inside the app against a known invoice, so
+// when one owns the receipt there is nothing left to work out: the money's
+// destination was decided before the customer entered their PIN. Matching
+// it again by amount and name can only ever disagree with that.
+//
+// Safaricom sends the two callbacks for the same payment within moments of
+// each other and in no guaranteed order, so this waits a little for the STK
+// side to land rather than concluding on the first look that no STK exists.
+// The wait costs nothing anybody is waiting on - the C2B handler has
+// already acknowledged Safaricom by the time this runs.
+//
+// Four looks over six seconds is the compromise. Every ordinary walk-in
+// Till payment pays the full six, because for those there is no STK to
+// find; making it longer would delay their matching for nothing. Making it
+// shorter risks the C2B side matching first and putting the money on an
+// invoice the push was never for - which the global receipt guard in
+// recordMpesaPayment then makes permanent, because it stops the STK
+// callback correcting it.
+async function findStkTransactionByReceipt(
+  receipt,
+  { attempts = 4, delayMs = 2000 } = {}
+) {
+  if (!receipt) return null;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const snap = await db
+        .collection("transactions")
+        .where("receipt", "==", receipt)
+        .limit(1)
+        .get();
+
+      if (!snap.empty) {
+        const doc = snap.docs[0];
+        return { id: doc.id, ...doc.data() };
+      }
+    } catch (err) {
+      console.error("Could not look up the STK transaction:", err.message);
+      return null;
+    }
+
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
 // ATTRIBUTING THE TILL PAYMENT ITSELF
 // ============================================================
 //
@@ -198,18 +320,33 @@ async function recordMpesaPayment({
 //
 // Returns the fields to merge into the c2b_transactions document.
 function tillPaymentMatchFields({ invoice, amount, strategy, result, source }) {
+  const reason = (result && result.reason) || "";
+
+  // "Already there" is a match, not a failure. Both reasons below mean the
+  // money is sitting on an invoice right now - the receipt was recorded by
+  // the STK callback, or by an earlier run of this very handler. Reporting
+  // that as unmatched is what made a payment that was already on an invoice
+  // show "No sale recorded for this money", and invited somebody to raise a
+  // second invoice for money already collected.
+  const alreadyThere =
+    reason === "already_recorded" || reason === "duplicate_receipt";
+
   const recorded = !!(result && result.recorded);
 
-  if (!recorded) {
-    // Matched to an invoice but nothing was written to it — a duplicate
-    // receipt, or the invoice vanished. The money is still unattributed,
-    // and the app should keep offering it for manual matching.
+  if (!recorded && !alreadyThere) {
+    // Matched to an invoice but nothing was written to it - the invoice
+    // vanished, or the write failed. The money really is unattributed, and
+    // the app should keep offering it for manual matching.
     return { matched: false, matchedInvoiceId: invoice.id, matchStrategy: strategy };
   }
 
+  // When the money turned out to be on a different invoice than this pass
+  // was aiming at, say where it actually is.
+  const invoiceId = (!recorded && result.invoiceId) || invoice.id;
+
   return {
     matched: true,
-    matchedInvoiceId: invoice.id,
+    matchedInvoiceId: invoiceId,
     matchStrategy: strategy,
 
     // Same shape as PaymentAllocation.toMap() in
@@ -217,7 +354,7 @@ function tillPaymentMatchFields({ invoice, amount, strategy, result, source }) {
     // only ever puts the whole payment on one invoice.
     allocations: [
       {
-        invoiceId: invoice.id,
+        invoiceId,
         invoiceNumber: result.invoiceNumber || "",
         amount,
       },
@@ -233,4 +370,9 @@ function tillPaymentMatchFields({ invoice, amount, strategy, result, source }) {
   };
 }
 
-module.exports = { recordMpesaPayment, tillPaymentMatchFields };
+module.exports = {
+  recordMpesaPayment,
+  tillPaymentMatchFields,
+  findReconciliationByReceipt,
+  findStkTransactionByReceipt,
+};
