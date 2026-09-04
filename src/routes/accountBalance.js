@@ -1,10 +1,9 @@
 const express = require("express");
-const axios = require("axios");
 
 const { admin, db } = require("../../firebase");
-const { buildSecurityCredential } = require("../../security_credential");
-const { ACCOUNT_BALANCE_URL, MPESA_HTTP_TIMEOUT } = require("../config");
-const { getMpesaAccessToken } = require("../services/mpesaAuth");
+const {
+  requestAccountBalance,
+} = require("../services/accountBalanceRequester");
 
 const router = express.Router();
 
@@ -12,10 +11,16 @@ const router = express.Router();
 // ACCOUNT BALANCE API
 // ============================================================
 //
+// The request itself lives in services/accountBalanceRequester.js, not
+// here. It has two callers now: this route, which is somebody in the app
+// pressing "check balance", and the C2B confirmation handler, which asks
+// on its own the moment a customer pays - the balance is not the same
+// number afterwards, and nobody should have to remember to go and look.
+//
 // Unlike STK Push and C2B, this uses Safaricom's Initiator-based
 // security model (Initiator name/password) instead of just the OAuth
-// consumer key/secret. The OAuth token itself IS reused from
-// getMpesaAccessToken() above, same as C2B registration.
+// consumer key/secret. The OAuth token itself is reused from
+// getMpesaAccessToken(), same as C2B registration.
 //
 // SecurityCredential is the Initiator password RSA-encrypted against
 // Safaricom's public certificate (certs/ProductionCertificate.cer),
@@ -36,84 +41,11 @@ router.post("/api/mpesa/account-balance", async (req, res) => {
   try {
     console.log("========== ACCOUNT BALANCE REQUEST ==========");
 
-    const initiatorName = process.env.INITIATOR_NAME;
+    const data = await requestAccountBalance(
+      "Selete Agro account balance query"
+    );
 
-    const partyA = process.env.ACCOUNT_BALANCE_SHORTCODE;
-
-    const resultURL = process.env.ACCOUNT_BALANCE_RESULT_URL;
-    const timeoutURL = process.env.ACCOUNT_BALANCE_TIMEOUT_URL;
-
-    if (!initiatorName) {
-      return res.status(500).json({
-        success: false,
-        error: "INITIATOR_NAME is not configured",
-      });
-    }
-
-    if (!partyA) {
-      return res.status(500).json({
-        success: false,
-        error: "ACCOUNT_BALANCE_SHORTCODE is not configured",
-      });
-    }
-
-    if (!resultURL || !timeoutURL) {
-      return res.status(500).json({
-        success: false,
-        error:
-          "ACCOUNT_BALANCE_RESULT_URL and ACCOUNT_BALANCE_TIMEOUT_URL must both be configured",
-      });
-    }
-
-    if (!process.env.INITIATOR_PASSWORD) {
-      return res.status(500).json({
-        success: false,
-        error: "INITIATOR_PASSWORD is not configured",
-      });
-    }
-
-    let securityCredential;
-    try {
-      securityCredential = buildSecurityCredential(
-        process.env.INITIATOR_PASSWORD
-      );
-    } catch (credErr) {
-      console.error("Failed to build SecurityCredential:", credErr.message);
-      return res.status(500).json({
-        success: false,
-        error: `Failed to build SecurityCredential: ${credErr.message}`,
-      });
-    }
-
-    const accessToken = await getMpesaAccessToken();
-
-    const payload = {
-      Initiator: initiatorName,
-      SecurityCredential: securityCredential,
-      CommandID: "AccountBalance",
-      PartyA: partyA,
-      IdentifierType: "2",
-      Remarks: "Selete Agro account balance query",
-      QueueTimeOutURL: timeoutURL,
-      ResultURL: resultURL,
-    };
-
-    // Never log SecurityCredential or the access token.
-    console.log("PartyA:", partyA);
-    console.log("Initiator:", initiatorName);
-    console.log("ResultURL:", resultURL);
-    console.log("QueueTimeOutURL:", timeoutURL);
-
-    const response = await axios.post(ACCOUNT_BALANCE_URL, payload, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-
-      timeout: MPESA_HTTP_TIMEOUT,
-    });
-
-    console.log("Account Balance accept response:", response.data);
+    console.log("Account Balance accept response:", data);
 
     res.json({
       success: true,
@@ -121,16 +53,11 @@ router.post("/api/mpesa/account-balance", async (req, res) => {
       message:
         "Request accepted - the actual balance arrives asynchronously at ACCOUNT_BALANCE_RESULT_URL, not in this response",
 
-      data: response.data,
+      data,
     });
   } catch (err) {
-    console.error(
-      "❌ Account balance request error:"
-    );
-
-    console.error(
-      err.response?.data || err.message
-    );
+    console.error("❌ Account balance request error:");
+    console.error(err.response?.data || err.message);
 
     if (err.code === "ECONNABORTED") {
       return res.status(504).json({

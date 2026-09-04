@@ -11,6 +11,9 @@ const {
   findStkTransactionByReceipt,
 } = require("../services/paymentRecorder");
 const { resolveMsisdn, looksHashed } = require("../services/msisdnDecoder");
+const {
+  requestAccountBalanceQuietly,
+} = require("../services/accountBalanceRequester");
 const { parseMpesaTimestamp } = require("../utils/mpesaDates");
 
 const router = express.Router();
@@ -431,6 +434,25 @@ router.post(
         ResultDesc: "Accepted",
       });
       responded = true;
+
+      // The Till has more money in it than it did a second ago, so
+      // whatever balance the app is showing is now wrong. Asking here
+      // rather than waiting for somebody to press "check balance" is the
+      // difference between a figure that is current and one that is
+      // whatever it was the last time anyone thought about it — and a stale
+      // balance is worse than none, because it looks current.
+      //
+      // Deliberately not awaited and deliberately unable to throw: the
+      // payment is already saved, Safaricom is already answered, and the
+      // balance is a display concern. Bursts are collapsed inside
+      // requestAccountBalanceQuietly — see the reasoning there.
+      requestAccountBalanceQuietly(
+        "Balance after Till payment " + TransID
+      ).then((outcome) => {
+        if (outcome !== "sent") {
+          console.log("Balance check after " + TransID + ": " + outcome);
+        }
+      });
 
       (async () => {
         let firestoreResult = "unknown";
