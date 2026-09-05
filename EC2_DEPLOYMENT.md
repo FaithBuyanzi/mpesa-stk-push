@@ -574,6 +574,26 @@ Once real payments are confirmed landing on EC2:
 
 ## Step 15 — The marketing site on the same box
 
+> **Superseded, kept for the history.** The website no longer runs on this
+> machine. It is served by Cloudflare Workers straight from the files in
+> the website repository, so there is no origin and no Caddy vhost for it
+> — see that repo's README under *Hosting* for why, and for the one-time
+> Cloudflare setup.
+>
+> What is still true here: the release **downloads** are too large for a
+> Workers static asset (25 MiB cap, ~70 MB APK), so they stay on this box.
+> They are served from the same folder by the same `file_server`, under
+> `dl.seleteagro.store` instead of `info.` — everything in 15c below
+> applies to that name, minus the `try_files` line, since a download host
+> serves one directory and no pages.
+>
+> `info.seleteagro.store` now points at the Worker, so the scp target
+> further down is `dl.`, not `info.`
+>
+> The rest of this step is left as written because it is the record of how
+> the box was set up, and because it is what to come back to if the site
+> ever needs an origin again.
+
 `info.seleteagro.store` serves
 [FaithBuyanzi/Selete-Agro-website](https://github.com/FaithBuyanzi/Selete-Agro-website)
 — plain HTML, CSS and JavaScript with no build step and no server side. Its
@@ -683,7 +703,7 @@ anything over 100 MB outright. They are copied straight onto the box:
 scp -i <your-key.pem> \
   SeleteAgro-FarmManager-Android-v<version>.zip \
   SeleteAgro-FarmManager-Windows-x64-v<version>.zip \
-  ubuntu@info.seleteagro.store:/var/www/selete-agro-website/downloads/
+  ubuntu@dl.seleteagro.store:/var/www/selete-agro-website/downloads/
 ```
 
 `downloads/.gitignore` in the site repo excludes everything in that folder, so
