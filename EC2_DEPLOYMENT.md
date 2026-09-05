@@ -649,7 +649,7 @@ be fighting it for permissions.
 
 ```caddyfile
 info.seleteagro.store {
-        root * /var/www/selete-agro-website
+        root * /var/www/Selete-Agro-website
 
         # /about as well as /about.html, without duplicating any pages.
         try_files {path} {path}.html {path}/index.html
@@ -685,7 +685,7 @@ curl -I https://api.seleteagro.store/health   # confirm the API is untouched
 ### 15d. Updating the site
 
 ```bash
-cd /var/www/selete-agro-website
+cd /var/www/Selete-Agro-website
 git pull
 ```
 
@@ -703,7 +703,7 @@ anything over 100 MB outright. They are copied straight onto the box:
 scp -i <your-key.pem> \
   SeleteAgro-FarmManager-Android-v<version>.zip \
   SeleteAgro-FarmManager-Windows-x64-v<version>.zip \
-  ubuntu@dl.seleteagro.store:/var/www/selete-agro-website/downloads/
+  ubuntu@dl.seleteagro.store:/var/www/Selete-Agro-website/downloads/
 ```
 
 `downloads/.gitignore` in the site repo excludes everything in that folder, so
@@ -738,7 +738,7 @@ restarting this service**, because that would take the Till offline to ship
 an app update.
 
 The binaries themselves are served by Caddy from
-`/var/www/selete-agro-website/downloads/` — the same place the products
+`/var/www/Selete-Agro-website/downloads/` — the same place the products
 page links to. They deliberately do not go through Node: a 70 MB transfer
 on this event loop would compete with Safaricom's payment callbacks, which
 have a deadline.
@@ -788,7 +788,7 @@ sudo systemctl restart selete-agro      # restart
 systemd-cgtop                           # per-service CPU / memory
 sudo systemctl reload caddy             # after editing /etc/caddy/Caddyfile
 journalctl -u caddy -f                  # proxy + TLS renewal logs
-cd /var/www/selete-agro-website && git pull   # publish website changes (no reload)
+cd /var/www/Selete-Agro-website && git pull   # publish website changes (no reload)
 df -h                                   # disk
 free -h                                 # memory + swap
 vmstat 1                                # si/so columns = active swapping
