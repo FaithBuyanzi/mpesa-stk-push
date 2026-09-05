@@ -14,6 +14,9 @@ const { resolveMsisdn, looksHashed } = require("../services/msisdnDecoder");
 const {
   requestAccountBalanceQuietly,
 } = require("../services/accountBalanceRequester");
+const {
+  fillCustomerPhoneFromInvoice,
+} = require("../services/customerDirectory");
 const { parseMpesaTimestamp } = require("../utils/mpesaDates");
 
 const router = express.Router();
@@ -528,6 +531,14 @@ router.post(
               matchedByName: "M-Pesa STK Push",
             });
 
+            // The push went to a number somebody typed for this
+            // customer, and it worked. If that customer has no number on
+            // file, this is the best evidence there will ever be for one.
+            await fillCustomerPhoneFromInvoice({
+              invoiceId: stk.invoiceId,
+              phone,
+            });
+
             firestoreResult =
               "STK Push payment - already recorded on invoice " +
               stk.invoiceId +
@@ -610,6 +621,19 @@ router.post(
                 source: "c2b",
               })
             );
+
+            // Matching is the moment this number and this customer are
+            // asserted to be the same person. Until now the system knew a
+            // payment came from 2547XXXXXXXX and, separately, that an
+            // invoice was for Jane Wanjiku.
+            //
+            // Only fills a gap, never creates a customer, and cannot throw
+            // - see customerDirectory.js. The money is already on the
+            // invoice by this point either way.
+            await fillCustomerPhoneFromInvoice({
+              invoiceId: invoice.id,
+              phone,
+            });
 
             firestoreResult = result.recorded
               ? `matched invoice ${invoice.id} via ${strategy}, invoice updated`

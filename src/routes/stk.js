@@ -4,6 +4,9 @@ const { admin, db } = require("../../firebase");
 const { stkPush, stkQuery } = require("../../mpesa");
 const validatePaymentRequest = require("../middleware/validatePaymentRequest");
 const { recordMpesaPayment } = require("../services/paymentRecorder");
+const {
+  fillCustomerPhoneFromInvoice,
+} = require("../services/customerDirectory");
 
 const router = express.Router();
 
@@ -362,6 +365,23 @@ router.post("/api/mpesa/callback", async (req, res) => {
       }).catch((err) =>
         console.error("Error auto-recording STK payment:", err)
       );
+
+      // A push that Safaricom completed is proof this number reaches this
+      // customer - better proof than anything typed into an address book.
+      // If the invoice's customer has no number on file, record it.
+      //
+      // Only ever fills a gap and never creates a customer; see
+      // customerDirectory.js. Not awaited, and unable to throw, because
+      // Safaricom has already been answered above and the payment is being
+      // recorded on its own.
+      fillCustomerPhoneFromInvoice({
+        invoiceId: txData.invoiceId,
+        phone: finalPhone,
+      }).then((outcome) => {
+        if (outcome === "filled") {
+          console.log("Recorded the payer's number on the customer");
+        }
+      });
 
       return;
     } else {
